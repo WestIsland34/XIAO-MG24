@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO GIF Player</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
+    --line: #dde1e8; --accent: #2563eb; --accent-text: #ffffff;
+    --ok: #15803d; --err: #b91c1c; --sel: #e8efff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #8d95a7;
+      --line: #2c323d; --accent: #4f8cff; --accent-text: #0b1220;
+      --ok: #4ade80; --err: #f87171; --sel: #1f2b44;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #8d95a7;
+    --line: #2c323d; --accent: #4f8cff; --accent-text: #0b1220;
+    --ok: #4ade80; --err: #f87171; --sel: #1f2b44;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+           display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; margin-right: auto; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; max-width: 1200px; margin: 0 auto; }
+  @media (max-width: 820px) { main { grid-template-columns: minmax(0, 1fr); } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  h2 { font-size: 14px; margin: 0 0 10px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .45; cursor: default; }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.ok { color: var(--ok); } .status.err { color: var(--err); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+  .item { border: 1px solid var(--line); border-radius: 6px; padding: 6px; cursor: pointer; background: var(--bg); min-width: 0; }
+  .item:hover { border-color: var(--accent); }
+  .item.sel { border-color: var(--accent); background: var(--sel); }
+  .item.playing { outline: 2px solid var(--ok); }
+  .item img { width: 100%; aspect-ratio: 3 / 2; object-fit: contain; background: #000; border-radius: 4px; display: block; }
+  .item .name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  canvas#preview { width: 288px; height: 192px; image-rendering: pixelated; background: #000;
+                   border-radius: 4px; display: block; max-width: 100%; }
+  .meta { font-size: 12px; color: var(--muted); margin: 8px 0; min-height: 18px; }
+  progress { width: 100%; height: 10px; }
+  label { display: flex; gap: 6px; align-items: center; }
+  select, input[type=number] { font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
+                               background: var(--panel); color: var(--text); }
+  input[type=number] { width: 64px; }
+  #log { font: 12px/1.4 ui-monospace, Consolas, monospace; background: var(--bg); border: 1px solid var(--line);
+         border-radius: 6px; padding: 8px; height: 150px; overflow: auto; white-space: pre-wrap; margin: 0; }
+  .warn { background: #fff4e5; color: #8a4b00; border: 1px solid #f3c58a; border-radius: 6px; padding: 8px 10px; margin: 16px 16px 0; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .warn { background: #33240f; color: #f7c27a; border-color: #6b4a1c; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>XIAO MG24 GIF Player</h1>
+  <span id="bleStatus" class="status">未接続</span>
+  <button id="btnConnect" class="primary">XIAO に接続</button>
+</header>
+<div id="warn" class="warn" hidden></div>
+<main>
+  <section>
+    <h2>GIF フォルダ</h2>
+    <div class="row">
+      <button id="btnFolder">フォルダを選ぶ</button>
+      <button id="btnLastFolder" hidden></button>
+      <button id="btnReload" hidden>再読み込み</button>
+      <span id="folderName" class="status"></span>
+      <input id="dirInput" type="file" webkitdirectory multiple hidden>
+    </div>
+    <div id="list" class="grid"><div class="empty">フォルダを選ぶと GIF が一覧表示されます</div></div>
+  </section>
+
+  <section>
+    <h2>プレビュー (96×64)</h2>
+    <canvas id="preview" width="96" height="64"></canvas>
+    <div id="meta" class="meta"></div>
+    <div class="row">
+      <label>合わせ方
+        <select id="fit">
+          <option value="contain">全体を表示</option>
+          <option value="cover">切り抜き</option>
+          <option value="stretch">引き伸ばし</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button id="btnSend" class="primary" disabled>XIAO で再生</button>
+      <button id="btnStop" disabled>停止</button>
+    </div>
+    <div class="row">
+      <label><input id="slideshow" type="checkbox"> 順番に切り替え</label>
+      <label><input id="interval" type="number" min="3" value="15"> 秒ごと</label>
+    </div>
+    <progress id="progress" max="1" value="0"></progress>
+    <div id="speed" class="meta"></div>
+    <h2>ログ</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+'use strict';
+// ===== 定数 (BLE_GIF_Player.ino と合わせる) =====
+const W = 96, H = 64, NPIX = W * H;
+const SVC  = '7e4a1000-5c3b-4f6e-9a21-3d8b6c0f1a20';
+const RX   = '7e4a1001-5c3b-4f6e-9a21-3d8b6c0f1a20';
+const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
+const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
+const MAX_FRAMES = 400;
+const WINDOW = 8192;           // ACK を待たずに送ってよいバイト数
+
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, cls = '') { const s = $('bleStatus'); s.textContent = text; s.className = 'status ' + cls; }
+
+// ===== 動作環境チェック =====
+(function checkEnv() {
+  const msgs = [];
+  if (!navigator.bluetooth) msgs.push('Web Bluetooth が使えません。Windows の Chrome か Edge で、https:// (GitHub Pages) または http://localhost で開いてください。');
+  if (!('ImageDecoder' in window)) msgs.push('このブラウザは ImageDecoder に未対応のため、GIF の 1 枚目だけを送ります。');
+  if (msgs.length) { $('warn').hidden = false; $('warn').textContent = msgs.join(' '); }
+  if (!navigator.bluetooth) $('btnConnect').disabled = true;
+})();
+
+// ===== CRC32 =====
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[i] = c >>> 0; }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ===== GIF → 96x64 のフレーム列 =====
+async function decodeGif(file, fit) {
+  const canvas = new OffscreenCanvas(W, H);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  const draw = (img, iw, ih) => {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    let dw = W, dh = H;
+    if (fit !== 'stretch') {
+      const s = fit === 'cover' ? Math.max(W / iw, H / ih) : Math.min(W / iw, H / ih);
+      dw = iw * s; dh = ih * s;
+    }
+    ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    return ctx.getImageData(0, 0, W, H).data;
+  };
+
+  const frames = [];
+  if ('ImageDecoder' in window) {
+    const dec = new ImageDecoder({ data: await file.arrayBuffer(), type: 'image/gif' });
+    await dec.tracks.ready;
+    const count = dec.tracks.selectedTrack.frameCount;
+    const step = Math.max(1, Math.ceil(count / MAX_FRAMES));
+    for (let i = 0; i < count; i += step) {
+      let delay = 0;
+      let last;
+      for (let j = i; j < Math.min(count, i + step); j++) {   // 間引いたフレームの時間は合算する
+        const { image } = await dec.decode({ frameIndex: j });
+        let d = image.duration == null ? 100 : image.duration / 1000;
+        if (d <= 10) d = 100;                                   // ブラウザと同じ扱い
+        delay += d;
+        if (j === i) last = draw(image, image.displayWidth, image.displayHeight);
+        image.close();
+      }
+      frames.push({ rgba: last, delay: Math.min(65535, Math.round(delay)) });
+    }
+    dec.close();
+  } else {
+    const bmp = await createImageBitmap(file);
+    frames.push({ rgba: draw(bmp, bmp.width, bmp.height), delay: 1000 });
+    bmp.close();
+  }
+  return frames;
+}
+
+// ===== 減色 (メディアンカット, 全フレーム共通の 256 色パレット) =====
+function key15(r, g, b) { return ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3); }
+
+function buildPalette(frames, maxColors = 256) {
+  const hist = new Uint32Array(32768);
+  for (const f of frames) { const d = f.rgba; for (let i = 0; i < d.length; i += 4) hist[key15(d[i], d[i + 1], d[i + 2])]++; }
+  const keys = [];
+  for (let k = 0; k < 32768; k++) if (hist[k]) keys.push(k);
+  const ch = (k, c) => c === 0 ? (k >> 10) & 31 : c === 1 ? (k >> 5) & 31 : k & 31;
+
+  let boxes = [keys];
+  if (keys.length > maxColors) {
+    while (boxes.length < maxColors) {
+      let best = -1, bestScore = -1, bestAxis = 0;
+      boxes.forEach((b, i) => {
+        if (b.length < 2) return;
+        let cnt = 0; const mn = [31, 31, 31], mx = [0, 0, 0];
+        for (const k of b) { cnt += hist[k]; for (let c = 0; c < 3; c++) { const v = ch(k, c); if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; } }
+        const ranges = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+        const axis = ranges.indexOf(Math.max(...ranges));
+        const score = ranges[axis] * Math.sqrt(cnt);
+        if (score > bestScore) { bestScore = score; best = i; bestAxis = axis; }
+      });
+      if (best < 0 || bestScore <= 0) break;
+      const b = boxes[best].sort((a, c) => ch(a, bestAxis) - ch(c, bestAxis));
+      let total = 0; for (const k of b) total += hist[k];
+      let acc = 0, cut = 1;
+      for (let i = 0; i < b.length - 1; i++) { acc += hist[b[i]]; if (acc >= total / 2) { cut = i + 1; break; } }
+      boxes.splice(best, 1, b.slice(0, cut), b.slice(cut));
+    }
+  } else {
+    boxes = keys.map(k => [k]);
+  }
+
+  const pal = boxes.map(b => {
+    let n = 0, r = 0, g = 0, bl = 0;
+    for (const k of b) { const w = hist[k]; n += w; r += (ch(k, 0) * 8 + 4) * w; g += (ch(k, 1) * 8 + 4) * w; bl += (ch(k, 2) * 8 + 4) * w; }
+    return [Math.round(r / n), Math.round(g / n), Math.round(bl / n)];
+  });
+  const map = new Int16Array(32768).fill(-1);
+  for (const k of keys) {
+    const r = ch(k, 0) * 8 + 4, g = ch(k, 1) * 8 + 4, b = ch(k, 2) * 8 + 4;
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < pal.length; i++) {
+      const dr = r - pal[i][0], dg = g - pal[i][1], db = b - pal[i][2];
+      const d = 3 * dr * dr + 4 * dg * dg + 2 * db * db;
+      if (d < bd) { bd = d; bi = i; }
+    }
+    map[k] = bi;
+  }
+  return { pal, map };
+}
+
+function rgb565([r, g, b]) { return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3); }
+
+// ===== フレーム差分の符号化 (書式は .ino 冒頭のコメント参照) =====
+function encodeFrame(cur, prev) {
+  const out = [];
+  const runLen = p => { let n = 1; while (p + n < NPIX && cur[p + n] === cur[p] && n < 64) n++; return n; };
+  let p = 0;
+  while (p < NPIX) {
+    if (cur[p] === prev[p]) {
+      let s = 0; while (p + s < NPIX && cur[p + s] === prev[p + s]) s++;
+      if (p + s >= NPIX) break;                 // 末尾の変化なしは省略
+      p += s;
+      while (s > 0) {
+        if (s > 64) { const n = Math.min(s, 16384); out.push(0xC0 | ((n - 1) >> 8), (n - 1) & 0xFF); s -= n; }
+        else { out.push(s - 1); s = 0; }
+      }
+      continue;
+    }
+    const r = runLen(p);
+    if (r >= 3) { out.push(0x40 | (r - 1), cur[p]); p += r; continue; }
+    const start = p;
+    while (p < NPIX && p - start < 64) {
+      if (cur[p] === prev[p] && (p + 1 >= NPIX || cur[p + 1] === prev[p + 1])) break;
+      if (p > start && runLen(p) >= 3) break;
+      p++;
+    }
+    out.push(0x80 | (p - start - 1));
+    for (let i = start; i < p; i++) out.push(cur[i]);
+  }
+  return out;
+}
+
+function decodeFrameInto(idx, d) {          // プレビュー用 (XIAO 側と同じ処理)
+  let i = 0, p = 0;
+  while (i < d.length && p < NPIX) {
+    const b = d[i++]; let n = (b & 63) + 1;
+    switch (b >> 6) {
+      case 0: p += n; break;
+      case 3: p += (((b & 63) << 8) | d[i++]) + 1; break;
+      case 1: { const v = d[i++]; idx.fill(v, p, Math.min(NPIX, p + n)); p += n; break; }
+      case 2: for (let k = 0; k < n && p < NPIX; k++) idx[p++] = d[i++]; break;
+    }
+  }
+}
+
+function buildAnimation(frames, maxBytes) {
+  const { pal, map } = buildPalette(frames);
+  const idxFrames = frames.map(f => {
+    const a = new Uint8Array(NPIX), d = f.rgba;
+    for (let p = 0, i = 0; p < NPIX; p++, i += 4) a[p] = map[key15(d[i], d[i + 1], d[i + 2])];
+    return a;
+  });
+  let list = idxFrames.map((idx, i) => ({ idx, delay: frames[i].delay }));
+  for (;;) {
+    const parts = [];
+    let prev = new Uint8Array(NPIX), size = 12 + pal.length * 2;
+    for (const f of list) { const e = encodeFrame(f.idx, prev); parts.push(e); size += 4 + e.length; prev = f.idx; }
+    if (size <= maxBytes || list.length <= 1) {
+      const buf = new Uint8Array(size), dv = new DataView(buf.buffer);
+      buf.set([0x47, 0x41, 0x30, 0x31], 0);   // "GA01"
+      buf[4] = W; buf[5] = H;
+      dv.setUint16(6, list.length, true); dv.setUint16(8, pal.length, true); dv.setUint16(10, 0, true);
+      let o = 12;
+      for (const c of pal) { dv.setUint16(o, rgb565(c), true); o += 2; }
+      list.forEach((f, i) => { dv.setUint16(o, f.delay, true); dv.setUint16(o + 2, parts[i].length, true); buf.set(parts[i], o + 4); o += 4 + parts[i].length; });
+      return { buf, frames: list.length, colors: pal.length, dropped: frames.length - list.length, tooLarge: size > maxBytes };
+    }
+    // 大きすぎる → 1 枚おきに間引いて時間を合算
+    const next = [];
+    for (let i = 0; i < list.length; i += 2) next.push({ idx: list[i].idx, delay: Math.min(65535, list[i].delay + (list[i + 1] ? list[i + 1].delay : 0)) });
+    list = next;
+  }
+}
+
+// ===== プレビュー再生 (送るデータそのものを展開して表示) =====
+let previewTimer = null;
+function startPreview(anim) {
+  clearTimeout(previewTimer);
+  const ctx = $('preview').getContext('2d');
+  const img = ctx.createImageData(W, H);
+  const buf = anim.buf, dv = new DataView(buf.buffer);
+  const nFrames = dv.getUint16(6, true), nCol = dv.getUint16(8, true);
+  const pal = [];
+  for (let i = 0; i < nCol; i++) {
+    const c = dv.getUint16(12 + i * 2, true);
+    pal.push([((c >> 11) & 31) * 255 / 31, ((c >> 5) & 63) * 255 / 63, (c & 31) * 255 / 31]);
+  }
+  const start = 12 + nCol * 2;
+  const idx = new Uint8Array(NPIX);
+  let pos = start, n = 0;
+  const step = () => {
+    if (n === 0) { idx.fill(0); pos = start; }
+    const delay = dv.getUint16(pos, true), len = dv.getUint16(pos + 2, true);
+    decodeFrameInto(idx, buf.subarray(pos + 4, pos + 4 + len));
+    for (let p = 0; p < NPIX; p++) { const c = pal[idx[p]] || [0, 0, 0]; img.data.set([c[0], c[1], c[2], 255], p * 4); }
+    ctx.putImageData(img, 0, 0);
+    pos += 4 + len; n = (n + 1) % nFrames;
+    previewTimer = setTimeout(step, Math.max(20, delay));
+  };
+  step();
+}
+
+// ===== フォルダと一覧 =====
+let files = [];          // { name, file }
+let selected = -1, playingIdx = -1;
+const animCache = new Map();
+
+async function readDirHandle(dir) {
+  const out = [];
+  for await (const [name, h] of dir.entries()) {
+    if (h.kind === 'file' && /\.gif$/i.test(name)) out.push({ name, file: await h.getFile() });
+  }
+  return out;
+}
+function setFiles(list, label) {
+  files = list.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }));
+  animCache.clear(); selected = -1; playingIdx = -1;
+  $('folderName').textContent = `${label} — ${files.length} 個の GIF`;
+  renderList();
+}
+function renderList() {
+  const el = $('list');
+  el.querySelectorAll('img').forEach(i => URL.revokeObjectURL(i.src));
+  el.innerHTML = '';
+  if (!files.length) { el.innerHTML = '<div class="empty">GIF が見つかりませんでした</div>'; return; }
+  files.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'item' + (i === selected ? ' sel' : '') + (i === playingIdx ? ' playing' : '');
+    d.title = f.name;
+    const img = document.createElement('img'); img.src = URL.createObjectURL(f.file); img.alt = f.name; img.loading = 'lazy';
+    const n = document.createElement('div'); n.className = 'name'; n.textContent = f.name;
+    d.append(img, n);
+    d.onclick = () => select(i);
+    d.ondblclick = () => select(i).then(() => sendSelected());
+    el.append(d);
+  });
+}
+function markItems() {
+  [...$('list').children].forEach((d, i) => {
+    d.classList.toggle('sel', i === selected);
+    d.classList.toggle('playing', i === playingIdx);
+  });
+}
+
+async function getAnim(i) {
+  const fit = $('fit').value;
+  const key = `${i}:${fit}:${device.bufSize}`;
+  if (animCache.has(key)) return animCache.get(key);
+  const t0 = performance.now();
+  const frames = await decodeGif(files[i].file, fit);
+  const anim = buildAnimation(frames, device.bufSize);
+  anim.ms = Math.round(performance.now() - t0);
+  animCache.set(key, anim);
+  return anim;
+}
+async function select(i) {
+  selected = i; markItems();
+  $('meta').textContent = '変換中…';
+  try {
+    const a = await getAnim(i);
+    if (selected !== i) return;
+    $('meta').textContent = `${files[i].name}: ${a.frames} フレーム / ${a.colors} 色 / ${(a.buf.length / 1024).toFixed(1)} KB`
+      + (a.dropped ? ` (容量オーバーのため ${a.dropped} フレーム間引き)` : '')
+      + (a.tooLarge ? ' ※それでも大きすぎます' : '');
+    startPreview(a);
+    updateButtons();
+  } catch (e) {
+    $('meta').textContent = `変換できませんでした: ${e.message}`;
+    log(`変換エラー ${files[i].name}: ${e.message}`);
+  }
+}
+
+// IndexedDB に前回のフォルダを覚えておく
+const idb = (mode, fn) => new Promise((res, rej) => {
+  const r = indexedDB.open('xiao-gif', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('kv');
+  r.onsuccess = () => { const tx = r.result.transaction('kv', mode); const q = fn(tx.objectStore('kv')); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); };
+  r.onerror = () => rej(r.error);
+});
+async function openDir(dir) {
+  setFiles(await readDirHandle(dir), dir.name);
+  $('btnReload').hidden = false;
+  $('btnReload').onclick = async () => setFiles(await readDirHandle(dir), dir.name);
+  try { await idb('readwrite', s => s.put(dir, 'lastDir')); } catch {}
+}
+$('btnFolder').onclick = async () => {
+  if (!window.showDirectoryPicker) { $('dirInput').click(); return; }
+  try { await openDir(await window.showDirectoryPicker({ id: 'gif', mode: 'read' })); }
+  catch (e) { if (e.name !== 'AbortError') log(`フォルダエラー: ${e.message}`); }
+};
+$('dirInput').onchange = e => {
+  const list = [...e.target.files].filter(f => /\.gif$/i.test(f.name)).map(f => ({ name: f.name, file: f }));
+  const label = e.target.files[0] ? e.target.files[0].webkitRelativePath.split('/')[0] : '';
+  setFiles(list, label);
+};
+(async () => {
+  try {
+    const dir = await idb('readonly', s => s.get('lastDir'));
+    if (!dir) return;
+    const b = $('btnLastFolder');
+    b.hidden = false; b.textContent = `前回のフォルダ: ${dir.name}`;
+    b.onclick = async () => {
+      if ((await dir.requestPermission({ mode: 'read' })) === 'granted') { await openDir(dir); b.hidden = true; }
+    };
+  } catch {}
+})();
+$('fit').onchange = () => { if (selected >= 0) select(selected); };
+
+// ===== Bluetooth =====
+const device = { dev: null, rx: null, tx: null, info: null, mtu: 23, bufSize: 160 * 1024, busy: false };
+let waiter = null;                          // 通知を待っている人
+const events = [];
+
+function onNotify(e) {
+  const v = new Uint8Array(e.target.value.buffer);
+  const dv = new DataView(v.buffer);
+  const ev = { code: v[0], value: v.length >= 5 ? dv.getUint32(1, true) : v[1] };
+  if (ev.code === 0x83 && ev.value !== 0) log(`XIAO: エラー ${['OK', 'CRC 不一致', '形式エラー', 'サイズ超過'][ev.value] || ev.value}`);
+  events.push(ev);
+  if (waiter) { const w = waiter; waiter = null; w(); }
+}
+function nextEvent(ms) {
+  if (events.length) return Promise.resolve(events.shift());
+  return new Promise(res => {
+    const t = setTimeout(() => { waiter = null; res(null); }, ms);
+    waiter = () => { clearTimeout(t); res(events.shift()); };
+  });
+}
+async function readInfo() {
+  const dv = await device.info.readValue();
+  device.mtu = dv.getUint16(1, true);
+  device.bufSize = dv.getUint32(3, true);
+  return dv.getUint8(0);
+}
+
+$('btnConnect').onclick = async () => {
+  if (device.dev && device.dev.gatt.connected) { device.dev.gatt.disconnect(); return; }
+  try {
+    setStatus('接続中…');
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'XIAO-GIF' }, { services: [SVC] }],
+      optionalServices: [SVC],
+    });
+    dev.addEventListener('gattserverdisconnected', onDisconnected);
+    const server = await dev.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    device.dev = dev;
+    device.rx = await svc.getCharacteristic(RX);
+    device.tx = await svc.getCharacteristic(TX);
+    device.info = await svc.getCharacteristic(INFO);
+    device.tx.addEventListener('characteristicvaluechanged', onNotify);
+    await device.tx.startNotifications();
+    const ver = await readInfo();
+    animCache.clear();
+    log(`接続: ${dev.name} (プロトコル v${ver}, MTU ${device.mtu}, バッファ ${device.bufSize / 1024} KB)`);
+    setStatus(`接続中: ${dev.name}`, 'ok');
+    $('btnConnect').textContent = '切断';
+    updateButtons();
+  } catch (e) {
+    setStatus('未接続');
+    if (e.name !== 'NotFoundError') log(`接続エラー: ${e.message}`);
+  }
+};
+function onDisconnected() {
+  log('切断されました');
+  setStatus('未接続', 'err');
+  $('btnConnect').textContent = 'XIAO に接続';
+  device.rx = device.tx = device.info = null;
+  if (waiter) { const w = waiter; waiter = null; w(); }
+  updateButtons();
+}
+function connected() { return !!(device.dev && device.dev.gatt.connected && device.rx); }
+function updateButtons() {
+  $('btnSend').disabled = !connected() || selected < 0 || device.busy;
+  $('btnStop').disabled = !connected() || device.busy;
+}
+
+async function sendAnimation(anim) {
+  const buf = anim.buf, total = buf.length;
+  await readInfo();                                  // MTU は接続後に変わることがある
+  const chunk = Math.max(20, Math.min(device.mtu - 3, 244));
+  const payload = chunk - 5;
+  events.length = 0;
+
+  const begin = new Uint8Array(5); begin[0] = 0x01; new DataView(begin.buffer).setUint32(1, total, true);
+  await device.rx.writeValueWithResponse(begin);
+  let ev = await nextEvent(3000);
+  if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? 'XIAO 側の容量を超えています' : 'BEGIN に応答がありません');
+
+  const t0 = performance.now();
+  let sendPos = 0, acked = 0, stall = 0;
+  const pkt = new Uint8Array(chunk), pdv = new DataView(pkt.buffer);
+  while (acked < total) {
+    if (!connected()) throw new Error('切断されました');
+    if (sendPos < total && sendPos - acked < WINDOW) {
+      const n = Math.min(payload, total - sendPos);
+      pkt[0] = 0x02; pdv.setUint32(1, sendPos, true); pkt.set(buf.subarray(sendPos, sendPos + n), 5);
+      await device.rx.writeValueWithoutResponse(pkt.subarray(0, 5 + n));
+      sendPos += n;
+      while (events.length) handle(events.shift());
+    } else {
+      const e = await nextEvent(1500);
+      if (e) { handle(e); stall = 0; }
+      else { sendPos = acked; if (++stall > 5) throw new Error('応答がありません'); log(`再送: ${acked} から`); }
+    }
+    $('progress').value = acked / total;
+  }
+  function handle(e) {
+    if (e.code === 0x81) acked = Math.max(acked, e.value);
+    else if (e.code === 0x82) { log(`抜けを検出: ${e.value} から再送`); sendPos = e.value; acked = Math.min(acked, e.value); }
+  }
+  const sec = (performance.now() - t0) / 1000;
+  $('speed').textContent = `${(total / 1024).toFixed(1)} KB を ${sec.toFixed(1)} 秒 (${(total / 1024 / sec).toFixed(1)} KB/s, パケット ${chunk} バイト)`;
+
+  const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
+  await device.rx.writeValueWithResponse(end);
+  for (;;) {
+    ev = await nextEvent(5000);
+    if (!ev) throw new Error('完了の応答がありません');
+    if (ev.code === 0x83) { if (ev.value !== 0) throw new Error('XIAO 側で検証に失敗しました'); break; }
+  }
+}
+
+async function sendIndex(i) {
+  if (!connected() || device.busy) return;
+  device.busy = true; updateButtons();
+  try {
+    const anim = await getAnim(i);
+    if (anim.tooLarge) throw new Error('容量に収まりません');
+    log(`送信: ${files[i].name} (${anim.frames} フレーム, ${(anim.buf.length / 1024).toFixed(1)} KB)`);
+    $('progress').value = 0;
+    await sendAnimation(anim);
+    playingIdx = i; markItems();
+    log('再生開始');
+  } catch (e) {
+    log(`送信失敗: ${e.message}`);
+  } finally {
+    device.busy = false; updateButtons();
+  }
+}
+function sendSelected() { if (selected >= 0) return sendIndex(selected); }
+$('btnSend').onclick = sendSelected;
+$('btnStop').onclick = async () => {
+  if (!connected()) return;
+  $('slideshow').checked = false;
+  await device.rx.writeValueWithResponse(new Uint8Array([0x04]));
+  playingIdx = -1; markItems();
+  log('停止');
+};
+
+// ===== 順番に切り替え =====
+let slideTimer = null;
+async function slideTick() {
+  clearTimeout(slideTimer);
+  if (!$('slideshow').checked) return;
+  if (connected() && !device.busy && files.length) {
+    const i = (playingIdx + 1) % files.length;
+    selected = i; markItems();
+    select(i);
+    await sendIndex(i);
+  }
+  slideTimer = setTimeout(slideTick, Math.max(3, +$('interval').value || 15) * 1000);
+}
+$('slideshow').onchange = () => slideTick();
+</script>
+</body>
+</html>
