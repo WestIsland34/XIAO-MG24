@@ -52,10 +52,17 @@
 #define OLED_MOSI  D10   // 基板表記 SDA
 #define OLED_SCLK  D8    // 基板表記 SCL
 
-// ソフトウェアSPI (動作確認済み)
+// 1: ハードウェアSPI (D8=SCK, D10=MOSI はXIAOのSPIピンそのもの。速い)
+// 0: ソフトウェアSPI (この CPU では digitalWrite で1ビットずつ送るのでとても遅い)
+// 画面が映らないときだけ 0 に戻す
+#define USE_HW_SPI 1
+#define SPI_HZ     8000000u   // SSD1331 の仕様上限付近。乱れるなら 4000000 に下げる
+
+#if USE_HW_SPI
+Adafruit_SSD1331 display(&SPI, OLED_CS, OLED_DC, OLED_RST);
+#else
 Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
-// ハードウェアSPI (高速だが未確認。試すならこちらに切り替え)
-// Adafruit_SSD1331 display(&SPI, OLED_CS, OLED_DC, OLED_RST);
+#endif
 
 #define SCR_W 96
 #define SCR_H 64
@@ -68,8 +75,15 @@ static const char DEVICE_NAME[] = "XIAO-GIF";
 
 static uint8_t  g_buf[BUF_SIZE];
 static uint8_t  g_idx[NPIX];          // 現在のフレーム (パレット番号)
+static uint8_t  g_shown[NPIX];        // いま画面に出ている内容 (差分描画用)
+static bool     g_forceFull = true;   // 次のフレームは全画面を描く
 static uint16_t g_pal[256];
 static uint16_t g_line[SCR_W];
+
+// 差分描画: 画面を 8x8 のタイルに分け、変化したタイルだけ送る
+#define TILE   8
+#define TILES_X (SCR_W / TILE)
+#define TILES_Y (SCR_H / TILE)
 
 enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_VERIFY, ST_PLAYING, ST_ERROR };
 static volatile uint8_t  g_state = ST_IDLE;
@@ -235,6 +249,7 @@ static uint8_t verify_and_parse() {
   g_framePos = start;
   g_frameNo = 0;
   g_nextAt = millis();
+  g_forceFull = true;   // 画面には受信中の表示が出ているので最初は全部描く
   return 0;
 }
 
@@ -276,15 +291,40 @@ static void decode_frame(const uint8_t *d, uint32_t len, int32_t &pmin, int32_t 
   }
 }
 
-static void push_rows(int y0, int y1) {
+// g_idx と g_shown を比べて、変化した 8x8 タイルだけを OLED に送る。
+// 横に並んだ変化タイルはまとめて 1 つの矩形として送る。戻り値は送った画素数。
+static uint32_t push_dirty_tiles(int y0, int y1, bool full) {
+  uint32_t pixels = 0;
+  int ty0 = y0 / TILE, ty1 = y1 / TILE;
   display.startWrite();
-  display.setAddrWindow(0, y0, SCR_W, y1 - y0 + 1);
-  for (int y = y0; y <= y1; y++) {
-    const uint8_t *row = g_idx + y * SCR_W;
-    for (int x = 0; x < SCR_W; x++) g_line[x] = g_pal[row[x]];
-    display.writePixels(g_line, SCR_W);
+  for (int ty = ty0; ty <= ty1; ty++) {
+    bool dirty[TILES_X];
+    for (int tx = 0; tx < TILES_X; tx++) {
+      bool d = full;
+      for (int y = ty * TILE; !d && y < ty * TILE + TILE; y++) {
+        int o = y * SCR_W + tx * TILE;
+        d = memcmp(g_idx + o, g_shown + o, TILE) != 0;
+      }
+      dirty[tx] = d;
+    }
+    for (int tx = 0; tx < TILES_X;) {
+      if (!dirty[tx]) { tx++; continue; }
+      int tx1 = tx;
+      while (tx1 + 1 < TILES_X && dirty[tx1 + 1]) tx1++;
+      int x0 = tx * TILE, w = (tx1 - tx + 1) * TILE;
+      display.setAddrWindow(x0, ty * TILE, w, TILE);
+      for (int y = ty * TILE; y < ty * TILE + TILE; y++) {
+        int o = y * SCR_W + x0;
+        for (int x = 0; x < w; x++) g_line[x] = g_pal[g_idx[o + x]];
+        memcpy(g_shown + o, g_idx + o, w);
+        display.writePixels(g_line, w);
+      }
+      pixels += (uint32_t)w * TILE;
+      tx = tx1 + 1;
+    }
   }
   display.endWrite();
+  return pixels;
 }
 
 static void play_next_frame() {
@@ -300,9 +340,31 @@ static void play_next_frame() {
 
   int32_t pmin = NPIX, pmax = -1;
   decode_frame(g_buf + g_framePos + 4, len, pmin, pmax);
-  if (g_frameNo == 0) { pmin = 0; pmax = NPIX - 1; }   // ループ先頭は全画面描き直し
+  // ループ先頭は「全画素0から」展開し直すので、範囲は画面全体と比べる
+  if (g_frameNo == 0 || g_forceFull) { pmin = 0; pmax = NPIX - 1; }
   if (g_state != ST_PLAYING) return;                    // 受信が始まったら描かない
-  if (pmax >= pmin) push_rows(pmin / SCR_W, pmax / SCR_W);
+
+  static uint32_t statFrames = 0, statPixels = 0, statUs = 0, statAt = 0, statLate = 0, statMaxLate = 0;
+  // 予定時刻からどれだけ遅れて描き始めたか (描画が間に合っていれば 0〜数ms)
+  uint32_t late = millis() - g_nextAt;
+  if (late > statMaxLate) statMaxLate = late;
+  if (late > 10) statLate++;
+  if (pmax >= pmin) {
+    uint32_t t0 = micros();
+    statPixels += push_dirty_tiles(pmin / SCR_W, pmax / SCR_W, g_forceFull);
+    statUs += micros() - t0;
+    g_forceFull = false;
+  }
+  if (++statFrames >= 50 || millis() - statAt > 5000) {
+    // ns/px: 1画素を送るのにかかった時間。SPI 8MHz の理論値は 16bit = 2000ns
+    Serial.printf("draw: %lu frames, avg %lu px / %lu us per frame, %lu ns/px, late>10ms %lu, max late %lu ms\n",
+                  (unsigned long)statFrames, (unsigned long)(statPixels / statFrames),
+                  (unsigned long)(statUs / statFrames),
+                  (unsigned long)(statPixels ? (uint64_t)statUs * 1000 / statPixels : 0),
+                  (unsigned long)statLate, (unsigned long)statMaxLate);
+    statFrames = statPixels = statUs = statLate = statMaxLate = 0;
+    statAt = millis();
+  }
 
   g_framePos += 4 + len;
   if (++g_frameNo >= g_frames) g_frameNo = 0;
@@ -317,7 +379,7 @@ static void play_next_frame() {
 void setup() {
   Serial.begin(115200);
   crc_init();
-  display.begin();
+  display.begin(SPI_HZ);
   display.fillScreen(0x0000);
   g_uiDirty = true;
 }
