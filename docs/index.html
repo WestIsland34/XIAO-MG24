@@ -118,7 +118,7 @@ const RX   = '7e4a1001-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const MAX_FRAMES = 400;
-const WINDOW = 8192;           // ACK を待たずに送ってよいバイト数
+const WINDOW = 4096;           // ACK を待たずに送ってよいバイト数
 
 const $ = id => document.getElementById(id);
 const logEl = $('log');
@@ -539,7 +539,7 @@ async function sendAnimation(anim) {
   if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? 'XIAO 側の容量を超えています' : 'BEGIN に応答がありません');
 
   const t0 = performance.now();
-  let sendPos = 0, acked = 0, stall = 0;
+  let sendPos = 0, acked = 0, stall = 0, rewinds = 0, naks = 0;
   const pkt = new Uint8Array(chunk), pdv = new DataView(pkt.buffer);
   while (acked < total) {
     if (!connected()) throw new Error('切断されました');
@@ -550,18 +550,23 @@ async function sendAnimation(anim) {
       sendPos += n;
       while (events.length) handle(events.shift());
     } else {
-      const e = await nextEvent(1500);
+      const e = await nextEvent(1000);
       if (e) { handle(e); stall = 0; }
-      else { sendPos = acked; if (++stall > 5) throw new Error('応答がありません'); log(`再送: ${acked} から`); }
+      else {
+        sendPos = acked; rewinds++;
+        if (++stall > 10) throw new Error(`応答がありません (${acked} バイトで停止)`);
+        log(`応答待ちタイムアウト: ${acked} から再送`);
+      }
     }
     $('progress').value = acked / total;
   }
   function handle(e) {
-    if (e.code === 0x81) acked = Math.max(acked, e.value);
-    else if (e.code === 0x82) { log(`抜けを検出: ${e.value} から再送`); sendPos = e.value; acked = Math.min(acked, e.value); }
+    if (e.code === 0x81) { acked = Math.max(acked, e.value); sendPos = Math.max(sendPos, acked); }
+    else if (e.code === 0x82) { naks++; sendPos = e.value; acked = Math.min(acked, e.value); }
   }
   const sec = (performance.now() - t0) / 1000;
   $('speed').textContent = `${(total / 1024).toFixed(1)} KB を ${sec.toFixed(1)} 秒 (${(total / 1024 / sec).toFixed(1)} KB/s, パケット ${chunk} バイト)`;
+  log(`転送 ${sec.toFixed(1)} 秒 / 抜け ${naks} 回 / タイムアウト ${rewinds} 回`);
 
   const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
   await device.rx.writeValueWithResponse(end);

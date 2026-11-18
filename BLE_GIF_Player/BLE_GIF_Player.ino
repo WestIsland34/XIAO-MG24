@@ -61,7 +61,7 @@ Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
 
 // ---------------- 受信バッファ ----------------
 #define BUF_SIZE   (160u * 1024u)
-#define ACK_EVERY  2048u
+#define ACK_EVERY  1024u
 #define PROTO_VER  1
 static const char DEVICE_NAME[] = "XIAO-GIF";
 
@@ -77,6 +77,12 @@ static volatile uint32_t g_received = 0;
 static volatile uint32_t g_lastAck = 0;
 static volatile uint32_t g_crcExpected = 0;
 static volatile bool     g_nakSent = false;
+// ACK/NAK は BLE タスクで直接送らず loop() から送る。送信バッファが一杯で
+// 失敗したときは次の loop() で送り直す (取りこぼすと PC 側が止まるため)
+static volatile bool     g_ackPending = false;
+static volatile bool     g_nakPending = false;
+static volatile int16_t  g_donePending = -1;
+static volatile uint32_t g_statDup = 0, g_statGap = 0, g_statNotifyFail = 0;
 static volatile bool     g_uiDirty = true;
 static volatile uint8_t  g_conn = 0xff;      // 接続ハンドル (0xff = 未接続)
 static volatile uint16_t g_mtu = 23;
@@ -97,7 +103,7 @@ static volatile bool g_txNotify = false;
 static void ble_init_gatt_db();
 static void ble_start_advertising();
 static void ble_update_info();
-static void notify(const uint8_t *data, uint8_t len);
+static bool notify(const uint8_t *data, uint8_t len);
 
 // ---------------- ユーティリティ ----------------
 static inline uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
@@ -118,14 +124,31 @@ static uint32_t crc32(const uint8_t *d, uint32_t n) {
   return c ^ 0xFFFFFFFFu;
 }
 
-static void send_ack(uint8_t code, uint32_t v) {
+static bool send_ack(uint8_t code, uint32_t v) {
   uint8_t m[5] = { code };
   wr32(m + 1, v);
-  notify(m, 5);
+  return notify(m, 5);
 }
-static void send_done(uint8_t result) {
+static bool send_done(uint8_t result) {
   uint8_t m[2] = { 0x83, result };
-  notify(m, 2);
+  return notify(m, 2);
+}
+
+// loop() から呼ぶ: 溜まっている通知を送る
+static void flush_notifications() {
+  if (g_nakPending) {
+    g_nakPending = false;
+    if (!send_ack(0x82, g_received)) g_nakPending = true;
+  }
+  if (g_ackPending) {
+    g_ackPending = false;
+    if (!send_ack(0x81, g_received)) g_ackPending = true;
+  }
+  int16_t d = g_donePending;
+  if (d >= 0) {
+    g_donePending = -1;
+    if (!send_done((uint8_t)d)) g_donePending = d;
+  }
 }
 
 // ---------------- 画面 ----------------
@@ -303,7 +326,18 @@ void loop() {
   static uint8_t shownState = 0xff;
   static uint8_t shownConn = 0xfe;
 
+  flush_notifications();
+
   uint8_t st = g_state;
+  if (st == ST_RECEIVING) {
+    static uint32_t lastStat = 0;
+    if (millis() - lastStat >= 1000) {
+      lastStat = millis();
+      Serial.printf("rx %lu/%lu  dup %lu gap %lu notifyFail %lu\n",
+                    (unsigned long)g_received, (unsigned long)g_total,
+                    (unsigned long)g_statDup, (unsigned long)g_statGap, (unsigned long)g_statNotifyFail);
+    }
+  }
   if (g_uiDirty || st != shownState || (st == ST_IDLE && g_conn != shownConn)) {
     g_uiDirty = false;
     shownState = st;
@@ -323,7 +357,7 @@ void loop() {
       g_errorCode = r;
       g_state = ST_ERROR;
     }
-    send_done(r);
+    g_donePending = r;
   } else if (st == ST_PLAYING) {
     if ((int32_t)(millis() - g_nextAt) >= 0) play_next_frame();
   }
@@ -340,7 +374,7 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       if (total == 0 || total > BUF_SIZE) {
         g_errorCode = 3;
         g_state = ST_ERROR;
-        send_done(3);
+        g_donePending = 3;
         return;
       }
       g_state = ST_RECEIVING;
@@ -348,18 +382,26 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       g_received = 0;
       g_lastAck = 0;
       g_nakSent = false;
+      g_nakPending = false;
+      g_statDup = g_statGap = g_statNotifyFail = 0;
       g_uiDirty = true;
-      send_ack(0x81, 0);
+      g_ackPending = true;
       break;
     }
     case 0x02: {  // DATA
       if (len < 5 || g_state != ST_RECEIVING) return;
       uint32_t off = rd32(d + 1);
       uint32_t n = len - 5;
-      if (off != g_received) {
-        if (off > g_received && !g_nakSent) {  // 抜けがあった
+      if (off < g_received) {        // 受信済みの再送 → 今の位置を知らせる
+        g_statDup++;
+        g_ackPending = true;
+        return;
+      }
+      if (off > g_received) {        // 抜けがあった → ここから送り直してと頼む
+        g_statGap++;
+        if (!g_nakSent) {
           g_nakSent = true;
-          send_ack(0x82, g_received);
+          g_nakPending = true;
         }
         return;
       }
@@ -369,14 +411,14 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       g_nakSent = false;
       if (g_received - g_lastAck >= ACK_EVERY || g_received == g_total) {
         g_lastAck = g_received;
-        send_ack(0x81, g_received);
+        g_ackPending = true;
       }
       break;
     }
     case 0x03: {  // END
       if (len < 5 || g_state != ST_RECEIVING) return;
       if (g_received != g_total) {
-        send_ack(0x82, g_received);
+        g_nakPending = true;
         return;
       }
       g_crcExpected = rd32(d + 1);
@@ -445,9 +487,11 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
   }
 }
 
-static void notify(const uint8_t *data, uint8_t len) {
-  if (g_conn == 0xff || !g_txNotify) return;
-  sl_bt_gatt_server_send_notification(g_conn, h_tx, len, data);
+static bool notify(const uint8_t *data, uint8_t len) {
+  if (g_conn == 0xff || !g_txNotify) return true;   // 送り先がないので捨てる
+  sl_status_t sc = sl_bt_gatt_server_send_notification(g_conn, h_tx, len, data);
+  if (sc != SL_STATUS_OK) { g_statNotifyFail++; return false; }
+  return true;
 }
 
 static void ble_update_info() {
