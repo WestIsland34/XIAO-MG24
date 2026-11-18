@@ -118,7 +118,7 @@ const RX   = '7e4a1001-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const MAX_FRAMES = 400;
-const WINDOW = 4096;           // ACK を待たずに送ってよいバイト数
+const BATCH = 4;               // 応答なしで続けて送るパケット数 (この数ごとに応答ありで同期)
 
 const $ = id => document.getElementById(id);
 const logEl = $('log');
@@ -539,42 +539,36 @@ async function sendAnimation(anim) {
   if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? 'XIAO 側の容量を超えています' : 'BEGIN に応答がありません');
 
   const t0 = performance.now();
-  let sendPos = 0, acked = 0, stall = 0, rewinds = 0, naks = 0;
+  let pos = 0, naks = 0, batch = BATCH, count = 0;
   const pkt = new Uint8Array(chunk), pdv = new DataView(pkt.buffer);
-  while (acked < total) {
-    if (!connected()) throw new Error('切断されました');
-    if (sendPos < total && sendPos - acked < WINDOW) {
-      const n = Math.min(payload, total - sendPos);
-      pkt[0] = 0x02; pdv.setUint32(1, sendPos, true); pkt.set(buf.subarray(sendPos, sendPos + n), 5);
-      await device.rx.writeValueWithoutResponse(pkt.subarray(0, 5 + n));
-      sendPos += n;
+  const handle = e => {
+    if (e.code === 0x82 && e.value < pos) { naks++; pos = e.value; batch = Math.max(1, batch >> 1); }
+  };
+  for (;;) {
+    while (pos < total) {
+      if (!connected()) throw new Error('切断されました');
+      const n = Math.min(payload, total - pos);
+      pkt[0] = 0x02; pdv.setUint32(1, pos, true); pkt.set(buf.subarray(pos, pos + n), 5);
+      const p = pkt.slice(0, 5 + n);
+      // BATCH 個に 1 個は応答ありで書く → XIAO が前の分まで処理し終わるまで待つ (流量制御)
+      if (++count % batch === 0 || pos + n >= total) await device.rx.writeValueWithResponse(p);
+      else await device.rx.writeValueWithoutResponse(p);
+      pos += n;
       while (events.length) handle(events.shift());
-    } else {
-      const e = await nextEvent(1000);
-      if (e) { handle(e); stall = 0; }
-      else {
-        sendPos = acked; rewinds++;
-        if (++stall > 10) throw new Error(`応答がありません (${acked} バイトで停止)`);
-        log(`応答待ちタイムアウト: ${acked} から再送`);
-      }
+      $('progress').value = pos / total;
     }
-    $('progress').value = acked / total;
-  }
-  function handle(e) {
-    if (e.code === 0x81) { acked = Math.max(acked, e.value); sendPos = Math.max(sendPos, acked); }
-    else if (e.code === 0x82) { naks++; sendPos = e.value; acked = Math.min(acked, e.value); }
+    const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
+    await device.rx.writeValueWithResponse(end);
+    ev = await nextEvent(5000);
+    while (ev && ev.code !== 0x83 && ev.code !== 0x82) ev = await nextEvent(5000);
+    if (!ev) throw new Error('完了の応答がありません');
+    if (ev.code === 0x82) { handle(ev); continue; }       // 抜けがあった → そこから続ける
+    if (ev.value !== 0) throw new Error('XIAO 側で検証に失敗しました');
+    break;
   }
   const sec = (performance.now() - t0) / 1000;
   $('speed').textContent = `${(total / 1024).toFixed(1)} KB を ${sec.toFixed(1)} 秒 (${(total / 1024 / sec).toFixed(1)} KB/s, パケット ${chunk} バイト)`;
-  log(`転送 ${sec.toFixed(1)} 秒 / 抜け ${naks} 回 / タイムアウト ${rewinds} 回`);
-
-  const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
-  await device.rx.writeValueWithResponse(end);
-  for (;;) {
-    ev = await nextEvent(5000);
-    if (!ev) throw new Error('完了の応答がありません');
-    if (ev.code === 0x83) { if (ev.value !== 0) throw new Error('XIAO 側で検証に失敗しました'); break; }
-  }
+  log(`転送 ${sec.toFixed(1)} 秒 / 抜け ${naks} 回`);
 }
 
 async function sendIndex(i) {

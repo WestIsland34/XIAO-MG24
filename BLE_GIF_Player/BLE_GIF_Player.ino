@@ -19,9 +19,11 @@
  *          0x02 DATA   u32 offset, payload...
  *          0x03 END    u32 crc32 (IEEE, 全データ)
  *          0x04 STOP
+ *          PC は DATA を 4 個に 1 個「応答あり」で書き込み、その応答を待ってから
+ *          次を送る (これが流量制御。XIAO が処理し終わるまで次が来ない)
  *   TX   ...1002  Notify (XIAO → PC)
- *          0x81 ACK    u32 receivedBytes
- *          0x82 NAK    u32 expectedOffset   (この位置から送り直して)
+ *          0x81 ACK    u32 receivedBytes    (BEGIN の受付時)
+ *          0x82 NAK    u32 expectedOffset   (抜けを検出。この位置から送り直して)
  *          0x83 DONE   u8 result (0=OK 1=CRC 2=FORMAT 3=TOO_LARGE)
  *   INFO ...1003  Read: u8 ver, u16 mtu, u32 bufSize, u8 width, u8 height
  *
@@ -61,7 +63,6 @@ Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
 
 // ---------------- 受信バッファ ----------------
 #define BUF_SIZE   (160u * 1024u)
-#define ACK_EVERY  1024u
 #define PROTO_VER  1
 static const char DEVICE_NAME[] = "XIAO-GIF";
 
@@ -74,7 +75,6 @@ enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_VERIFY, ST_PLAYING, ST_ERROR };
 static volatile uint8_t  g_state = ST_IDLE;
 static volatile uint32_t g_total = 0;
 static volatile uint32_t g_received = 0;
-static volatile uint32_t g_lastAck = 0;
 static volatile uint32_t g_crcExpected = 0;
 static volatile bool     g_nakSent = false;
 // ACK/NAK は BLE タスクで直接送らず loop() から送る。送信バッファが一杯で
@@ -380,28 +380,28 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       g_state = ST_RECEIVING;
       g_total = total;
       g_received = 0;
-      g_lastAck = 0;
       g_nakSent = false;
       g_nakPending = false;
       g_statDup = g_statGap = g_statNotifyFail = 0;
       g_uiDirty = true;
-      g_ackPending = true;
+      if (!send_ack(0x81, 0)) g_ackPending = true;
       break;
     }
     case 0x02: {  // DATA
       if (len < 5 || g_state != ST_RECEIVING) return;
       uint32_t off = rd32(d + 1);
       uint32_t n = len - 5;
-      if (off < g_received) {        // 受信済みの再送 → 今の位置を知らせる
+      // 流量制御は PC 側の「応答ありの書き込み」で行うので、通常は ACK を返さない。
+      // 抜けたときだけ NAK でやり直し位置を知らせる。
+      if (off < g_received) {        // 受信済みの再送 → 捨てる
         g_statDup++;
-        g_ackPending = true;
         return;
       }
       if (off > g_received) {        // 抜けがあった → ここから送り直してと頼む
         g_statGap++;
         if (!g_nakSent) {
           g_nakSent = true;
-          g_nakPending = true;
+          if (!send_ack(0x82, g_received)) g_nakPending = true;
         }
         return;
       }
@@ -409,16 +409,12 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       memcpy(g_buf + off, d + 5, n);
       g_received = off + n;
       g_nakSent = false;
-      if (g_received - g_lastAck >= ACK_EVERY || g_received == g_total) {
-        g_lastAck = g_received;
-        g_ackPending = true;
-      }
       break;
     }
     case 0x03: {  // END
       if (len < 5 || g_state != ST_RECEIVING) return;
       if (g_received != g_total) {
-        g_nakPending = true;
+        if (!send_ack(0x82, g_received)) g_nakPending = true;
         return;
       }
       g_crcExpected = rd32(d + 1);
