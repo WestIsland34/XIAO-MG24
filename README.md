@@ -61,7 +61,7 @@ PC (Chrome / Edge)                                  XIAO MG24
 3. 書き込むと OLED に「Waiting for PC / XIAO-GIF」と表示される
 
 ### PC 側（Windows の Chrome または Edge）
-- **GitHub Pages**: https://westisland34.github.io/XIAO-MG24/ を開く（Pages を有効にした場合）
+- **GitHub Pages**: https://westisland.jp/XIAO-MG24/ を開く（必ず https:// で）
 - **ローカル**: `docs` フォルダで `python -m http.server 8000` を実行し、http://localhost:8000 を開く
   （Web Bluetooth は https か localhost でしか使えない）
 
