@@ -13,8 +13,12 @@ XIAO MG24 (EFR32MG24) で遊ぶ Arduino プロジェクト。詳細は README.md
 ## BLE GIF Player
 - XIAO 側 `BLE_GIF_Player/` は Protocol stack **BLE (Silabs)**（sl_bt_* API, 動的 GATT）。PC 側は `docs/index.html` 1ファイル（Web Bluetooth + ImageDecoder, ビルド不要）。
 - 通信仕様・アニメ形式は .ino 冒頭コメントが正。変えるときは .ino と index.html の両方を直す。
-- コンパイル確認: `arduino-cli compile -b SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs BLE_GIF_Player`（RAM 約74%使用、受信バッファ160KB）。
-- 実機で転送・再生を確認済み（2026-11-19）。転送は「4パケットに1回、応答ありで書く」流量制御。応答なし書き込みを流し続けると XIAO の BLE バッファ(約3KB)が詰まり、ACK 通知が出せなくなる。
+- コンパイル確認: `arduino-cli compile -b SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs BLE_GIF_Player`（RAM 約23%）。
+- アニメは基板上の外付けフラッシュに保存: SPI1 (PB0/PB1/PA0) + CS=PA6(ピン21)。JEDEC ID `85 60 16` = Puya 4MB。ボード定義の mx25 shutdown 設定 (PC1-4) は実配線と違うので無視。
+- **コア SPI ライブラリ 5.0.0 の不具合**: `transfer(buf, n)`（送受信）は 2048 バイト超を分割するとき位置をずらさない → 2048 バイト以下に分けて呼ぶ。送信のみの `transfer(buf, n, true)` は正しい。
+- 実機で転送・保存・再生・電源再投入後の自動再生を確認済み（2026-11-19）。
+- 転送は「12パケットに1回、応答ありで書く」流量制御。RX はアプリ管理値 (user_write_request) で、受信はキューに積んで loop() がフラッシュに書く。キューに空きがあれば応答はすぐ返す。応答なし書き込みを流し続けると XIAO の BLE バッファ(約3KB)が詰まる。
+- 速度の実測 (Windows + Chrome): 接続間隔 15ms・1M PHY・MTU 247 で約 14KB/s。Chrome の書き込み 1 回 17〜20ms が上限。7.5ms 固定や同時書き込み (Chrome が失敗する) は効果なし。
 - このコアの SPI は転送1回ごとに DMA を起動する（1回約25us）。Adafruit の writePixels は1画素ずつ送るので約26us/px と遅い。画素はバッファに詰めて `SPI.transfer(buf, n, true)` で一括送信する（DMA 1回の上限 2048 バイト）。
 - 描画は 8x8 タイル単位の差分。8行の帯ごとに変化範囲を1矩形にまとめて送る。シリアルに `draw: ... ns/px, late>10ms ...` を出す（理論値 2000ns/px @8MHz）。
 

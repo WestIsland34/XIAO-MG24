@@ -119,7 +119,9 @@ const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const MAX_FRAMES = 1500;
 const BATCH = 12;              // この数ごとに 1 回「応答あり」で書いて同期する (XIAO の RESP_MIN_FREE 以下にする)
-const PIPE = 4;                // 応答なしの書き込みを完了待ちせずに同時に出す数
+// 応答なしの書き込みを完了待ちせずに同時に出す数。
+// Windows の Chrome では同時に出すと失敗する (実測) ので 1。他の環境で試すなら増やす。
+const PIPE = 1;
 
 const $ = id => document.getElementById(id);
 const logEl = $('log');

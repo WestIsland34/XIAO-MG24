@@ -2,7 +2,9 @@
  * XIAO MG24 BLE GIF Player
  *
  * PC のブラウザ (docs/index.html, Web Bluetooth) から送られてきた
- * GIF アニメ (96x64 / 256色に変換済み) を受信し、SSD1331 OLED でループ再生する。
+ * GIF アニメ (96x64 / 256色に変換済み) を受信して XIAO 基板上の外付けフラッシュ
+ * (SPI1, CS=PA6) に保存し、SSD1331 OLED でループ再生する。
+ * 電源を入れ直しても、保存されているアニメを自動で再生する。
  *
  * ボード         : Silicon Labs → Seeed Studio XIAO MG24 (Sense)
  * Protocol stack : BLE (Silabs)   ← None ではないので注意
@@ -20,12 +22,12 @@
  *          0x03 END    u32 crc32 (IEEE, 全データ)
  *          0x04 STOP
  *          PC は DATA を 4 個に 1 個「応答あり」で書き込み、その応答を待ってから
- *          次を送る (これが流量制御。XIAO が処理し終わるまで次が来ない)
+ *          次を送る。XIAO はフラッシュに書き終わってから応答を返す (= 流量制御)。
  *   TX   ...1002  Notify (XIAO → PC)
  *          0x81 ACK    u32 receivedBytes    (BEGIN の受付時)
  *          0x82 NAK    u32 expectedOffset   (抜けを検出。この位置から送り直して)
- *          0x83 DONE   u8 result (0=OK 1=CRC 2=FORMAT 3=TOO_LARGE)
- *   INFO ...1003  Read: u8 ver, u16 mtu, u32 bufSize, u8 width, u8 height
+ *          0x83 DONE   u8 result (0=OK 1=CRC 2=FORMAT 3=TOO_LARGE 4=NO_FLASH)
+ *   INFO ...1003  Read: u8 ver, u16 mtu, u32 maxBytes, u8 width, u8 height
  *
  * ---- アニメデータ形式 ----
  *   "GA01"(4) u8 w, u8 h, u16 frames, u16 nColors, u16 reserved,
@@ -37,7 +39,12 @@
  *     10nnnnnn v...     : LITERAL n+1 画素ぶんの色番号
  *     11nnnnnn nnnnnnnn : 長いSKIP 14bit+1 画素
  *   1枚目は「全画素 0」から の差分。
+ *
+ * ---- フラッシュの使い方 ----
+ *   0x000000 : ヘッダ "GAF1"(4) u32 total, u32 crc32   (受信と検証が済んでから書く)
+ *   0x001000 : アニメデータ本体 (受信しながら 4KB ずつ消去して書く)
  */
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1331.h>
 
@@ -54,7 +61,6 @@
 
 // 1: ハードウェアSPI (D8=SCK, D10=MOSI はXIAOのSPIピンそのもの。速い)
 // 0: ソフトウェアSPI (この CPU では digitalWrite で1ビットずつ送るのでとても遅い)
-// 画面が映らないときだけ 0 に戻す
 #define USE_HW_SPI 1
 #define SPI_HZ     8000000u   // SSD1331 の仕様上限付近。乱れるなら 4000000 に下げる
 
@@ -68,12 +74,9 @@ Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
 #define SCR_H 64
 #define NPIX  (SCR_W * SCR_H)
 
-// ---------------- 受信バッファ ----------------
-#define BUF_SIZE   (160u * 1024u)
-#define PROTO_VER  1
+#define PROTO_VER  2
 static const char DEVICE_NAME[] = "XIAO-GIF";
 
-static uint8_t  g_buf[BUF_SIZE];
 static uint8_t  g_idx[NPIX];          // 現在のフレーム (パレット番号)
 static uint8_t  g_shown[NPIX];        // いま画面に出ている内容 (差分描画用)
 static bool     g_forceFull = true;   // 次のフレームは全画面を描く
@@ -85,29 +88,60 @@ static uint16_t g_line[SCR_W];
 #define TILES_X (SCR_W / TILE)
 #define TILES_Y (SCR_H / TILE)
 
-enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_VERIFY, ST_PLAYING, ST_ERROR };
-static volatile uint8_t  g_state = ST_IDLE;
-static volatile uint32_t g_total = 0;
-static volatile uint32_t g_received = 0;
-static volatile uint32_t g_crcExpected = 0;
-static volatile bool     g_nakSent = false;
-// ACK/NAK は BLE タスクで直接送らず loop() から送る。送信バッファが一杯で
-// 失敗したときは次の loop() で送り直す (取りこぼすと PC 側が止まるため)
-static volatile bool     g_ackPending = false;
-static volatile bool     g_nakPending = false;
-static volatile int16_t  g_donePending = -1;
-static volatile uint32_t g_statDup = 0, g_statGap = 0, g_statNotifyFail = 0;
-static volatile bool     g_uiDirty = true;
+// ---------------- 外付けフラッシュ (SPI1) ----------------
+#define FLASH_CS        21          // PA6 (pins_arduino.h の SS1)
+#define FLASH_HZ        8000000u
+#define FLASH_HDR_ADDR  0x000000u
+#define FLASH_DATA_ADDR 0x001000u
+#define FLASH_SECTOR    4096u
+#define FLASH_PAGE      256u
+#define FRAME_MAX       8192u       // 1 フレームの差分データの上限 (実際は最大 6.3KB 程度)
+
+static SPISettings g_flashSpi(FLASH_HZ, MSBFIRST, SPI_MODE0);
+static uint32_t g_flashSize = 0;    // 0 = 見つからない
+static uint8_t  g_flashId[3];
+static uint8_t  g_fbuf[FRAME_MAX];  // フレーム読み出し・CRC 計算用
+
+// ---------------- 状態 ----------------
+// 状態の変更とフラッシュの読み書きは loop() だけが行う。
+// BLE のイベント処理は受信パケットをキューに積むだけ。
+enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_PLAYING, ST_ERROR };
+static uint8_t  g_state = ST_IDLE;
+static uint32_t g_total = 0;
+static uint32_t g_received = 0;
+static uint32_t g_erasedUpTo = 0;   // ここ (フラッシュのアドレス) までは消去済み
+static bool     g_nakSent = false;
+static bool     g_ackPending = false, g_nakPending = false;
+static int16_t  g_donePending = -1;
+static uint32_t g_statDup = 0, g_statGap = 0, g_statNotifyFail = 0;
+static bool     g_uiDirty = true;
+static uint8_t  g_errorCode = 0;
+
 static volatile uint8_t  g_conn = 0xff;      // 接続ハンドル (0xff = 未接続)
 static volatile uint16_t g_mtu = 23;
-static volatile uint8_t  g_errorCode = 0;
 
-// 再生状態 (loop タスクのみが触る)
+// 再生状態
 static uint16_t g_frames = 0;
-static uint32_t g_framesStart = 0;
+static uint32_t g_framesStart = 0;  // フラッシュ上のアドレス
 static uint32_t g_framePos = 0;
 static uint16_t g_frameNo = 0;
 static uint32_t g_nextAt = 0;
+
+// 受信キュー (BLE タスク → loop)
+// PC は 12 パケットに 1 回「応答あり」で書き、応答を待つ (docs/index.html の BATCH)。
+// キューに RESP_MIN_FREE 個以上の空きがあれば、届いた時点ですぐ応答する
+// (フラッシュへの書き込みを待たないので速い)。空きが少ないときだけ処理後に応答する。
+#define RXQ_N         48
+#define RESP_MIN_FREE 16
+struct RxPkt {
+  uint8_t len;
+  uint8_t needResp;   // 処理後に応答を返す必要がある
+  uint8_t conn;
+  uint8_t data[244];
+};
+static RxPkt g_rxq[RXQ_N];
+static volatile uint8_t g_rxHead = 0, g_rxTail = 0;
+static volatile uint32_t g_rxOverflow = 0;
 
 // GATT
 static uint16_t gattdb_session_id;
@@ -132,12 +166,122 @@ static void crc_init() {
     crc_table[i] = c;
   }
 }
-static uint32_t crc32(const uint8_t *d, uint32_t n) {
-  uint32_t c = 0xFFFFFFFFu;
+static uint32_t crc32_update(uint32_t c, const uint8_t *d, uint32_t n) {
   for (uint32_t i = 0; i < n; i++) c = crc_table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
-  return c ^ 0xFFFFFFFFu;
+  return c;
 }
 
+// ---------------- フラッシュ ----------------
+static inline void fl_begin() { SPI1.beginTransaction(g_flashSpi); digitalWrite(FLASH_CS, LOW); }
+static inline void fl_end()   { digitalWrite(FLASH_CS, HIGH); SPI1.endTransaction(); }
+
+static void fl_cmd(uint8_t c) { fl_begin(); SPI1.transfer(c); fl_end(); }
+static void fl_cmd_addr(uint8_t c, uint32_t a) {
+  SPI1.transfer(c);
+  SPI1.transfer((uint8_t)(a >> 16));
+  SPI1.transfer((uint8_t)(a >> 8));
+  SPI1.transfer((uint8_t)a);
+}
+static uint8_t fl_status() {
+  fl_begin();
+  SPI1.transfer(0x05);
+  uint8_t s = SPI1.transfer(0x00);
+  fl_end();
+  return s;
+}
+static void fl_wait(bool slow) {
+  while (fl_status() & 0x01) {   // WIP (書き込み/消去中)
+    if (slow) delay(1);
+  }
+}
+static void fl_read(uint32_t a, uint8_t *buf, uint32_t n) {
+  if (n == 0) return;
+  fl_begin();
+  fl_cmd_addr(0x03, a);
+  // DMA でまとめて読む (送る中身は無視される)。
+  // コアの SPI ライブラリ (5.0.0) は 2048 バイトを超える送受信を分割するとき
+  // 位置をずらさない不具合があるので、2048 バイトずつに分けて呼ぶ。
+  while (n > 0) {
+    uint32_t k = n < 2048 ? n : 2048;
+    SPI1.transfer(buf, k);
+    buf += k; n -= k;
+  }
+  fl_end();
+}
+static uint32_t g_flashBusyUs = 0;   // 消去・書き込みにかかった時間 (統計用)
+
+static void fl_erase_sector(uint32_t a) {
+  uint32_t t0 = micros();
+  fl_cmd(0x06);                  // 書き込み許可
+  fl_begin();
+  fl_cmd_addr(0x20, a);          // 4KB 消去
+  fl_end();
+  fl_wait(true);
+  g_flashBusyUs += micros() - t0;
+}
+static void fl_program(uint32_t a, const uint8_t *d, uint32_t n) {
+  // 送信専用の DMA 転送は受信側にデータが残り、直後のステータス読み出し
+  // (書き込み完了待ち) が古い値を読んでしまうことがある。送受信の転送を使う。
+  static uint8_t tmp[FLASH_PAGE];
+  uint32_t t0 = micros();
+  while (n > 0) {
+    uint32_t room = FLASH_PAGE - (a % FLASH_PAGE);   // ページをまたがないように
+    uint32_t k = n < room ? n : room;
+    memcpy(tmp, d, k);
+    fl_cmd(0x06);
+    fl_begin();
+    fl_cmd_addr(0x02, a);
+    SPI1.transfer(tmp, k);
+    fl_end();
+    fl_wait(false);
+    a += k; d += k; n -= k;
+  }
+  g_flashBusyUs += micros() - t0;
+}
+
+// 最後の 4KB で書き込み・読み出しを試す。結果を msg に入れて返す
+static bool fl_selftest(char *msg, size_t msgLen) {
+  uint8_t sr = fl_status();
+  if (sr & 0x3C) {               // ブロック保護ビットが立っていたら外す
+    fl_cmd(0x06);
+    fl_begin(); SPI1.transfer(0x01); SPI1.transfer(0x00); fl_end();
+    fl_wait(false);
+  }
+  uint32_t a = g_flashSize - FLASH_SECTOR;
+  fl_erase_sector(a);
+  uint8_t buf[300];
+  fl_read(a, buf, 16);
+  bool erased = true;
+  for (int i = 0; i < 16; i++) if (buf[i] != 0xFF) erased = false;
+  uint8_t pat[300];
+  for (int i = 0; i < 300; i++) pat[i] = (uint8_t)(i * 7 + 3);
+  fl_program(a + 100, pat, sizeof(pat));   // ページ境界 (256) をまたぐ
+  memset(buf, 0, sizeof(buf));
+  fl_read(a + 100, buf, sizeof(buf));
+  int bad = 0;
+  for (int i = 0; i < 300; i++) if (buf[i] != pat[i]) bad++;
+  snprintf(msg, msgLen, "SR %02X->%02X erase %s rw %s (%d bad)", sr, fl_status(),
+           erased ? "OK" : "NG", bad ? "NG" : "OK", bad);
+  return erased && bad == 0;
+}
+static bool fl_init() {
+  pinMode(FLASH_CS, OUTPUT);
+  digitalWrite(FLASH_CS, HIGH);
+  SPI1.begin();
+  fl_cmd(0xAB);                  // 省電力の休止状態から起こす
+  delayMicroseconds(100);
+  fl_begin();
+  SPI1.transfer(0x9F);           // JEDEC ID
+  for (int i = 0; i < 3; i++) g_flashId[i] = SPI1.transfer(0x00);
+  fl_end();
+  uint8_t cap = g_flashId[2];
+  if (g_flashId[0] == 0x00 || g_flashId[0] == 0xFF || cap < 0x10 || cap > 0x1A) return false;
+  g_flashSize = 1u << cap;
+  return true;
+}
+static uint32_t flash_max_bytes() { return g_flashSize ? g_flashSize - FLASH_DATA_ADDR : 0; }
+
+// ---------------- 通知 ----------------
 static bool send_ack(uint8_t code, uint32_t v) {
   uint8_t m[5] = { code };
   wr32(m + 1, v);
@@ -147,8 +291,6 @@ static bool send_done(uint8_t result) {
   uint8_t m[2] = { 0x83, result };
   return notify(m, 2);
 }
-
-// loop() から呼ぶ: 溜まっている通知を送る
 static void flush_notifications() {
   if (g_nakPending) {
     g_nakPending = false;
@@ -158,8 +300,8 @@ static void flush_notifications() {
     g_ackPending = false;
     if (!send_ack(0x81, g_received)) g_ackPending = true;
   }
-  int16_t d = g_donePending;
-  if (d >= 0) {
+  if (g_donePending >= 0) {
+    int16_t d = g_donePending;
     g_donePending = -1;
     if (!send_done((uint8_t)d)) g_donePending = d;
   }
@@ -178,6 +320,7 @@ static void screen_message(const char *l1, const char *l2, uint16_t color) {
   display.print(l1);
   display.setCursor(2, 34);
   display.print(l2);
+  g_forceFull = true;
 }
 
 static uint8_t g_progShown = 0;
@@ -187,9 +330,8 @@ static void screen_progress_init() {
   g_progShown = 0;
 }
 static void screen_progress_update() {
-  uint32_t tot = g_total, rec = g_received;
-  if (tot == 0) return;
-  uint8_t pct = (uint8_t)((uint64_t)rec * 100 / tot);
+  if (g_total == 0) return;
+  uint8_t pct = (uint8_t)((uint64_t)g_received * 100 / g_total);
   if (pct == g_progShown) return;
   int wFull = SCR_W - 8;
   int x0 = 4 + wFull * g_progShown / 100;
@@ -200,7 +342,7 @@ static void screen_progress_update() {
   display.setTextColor(0xFFFF);
   display.print(pct);
   display.print("%  ");
-  display.print(rec / 1024);
+  display.print(g_received / 1024);
   display.print("KB");
   g_progShown = pct;
 }
@@ -208,15 +350,16 @@ static void screen_progress_update() {
 static void screen_status() {
   switch (g_state) {
     case ST_IDLE:
-      if (g_conn == 0xff) screen_message("Waiting for PC", DEVICE_NAME, 0xFFE0);
-      else                screen_message("Connected", "Select a GIF", 0x07E0);
+      if (!g_flashSize)        screen_message("Flash not found", "", 0xF800);
+      else if (g_conn == 0xff) screen_message("Waiting for PC", DEVICE_NAME, 0xFFE0);
+      else                     screen_message("Connected", "Select a GIF", 0x07E0);
       break;
     case ST_RECEIVING:
       screen_progress_init();
       break;
     case ST_ERROR: {
       const char *msg = g_errorCode == 1 ? "CRC error" : g_errorCode == 2 ? "Format error"
-                      : g_errorCode == 3 ? "Too large" : "Error";
+                      : g_errorCode == 3 ? "Too large" : g_errorCode == 4 ? "No flash" : "Error";
       screen_message(msg, "Send again", 0xF800);
       break;
     }
@@ -226,31 +369,67 @@ static void screen_status() {
 }
 
 // ---------------- アニメ ----------------
-static uint8_t verify_and_parse() {
-  uint32_t total = g_total;
-  if (crc32(g_buf, total) != g_crcExpected) return 1;
-  if (total < 12 || memcmp(g_buf, "GA01", 4) != 0) return 2;
-  if (g_buf[4] != SCR_W || g_buf[5] != SCR_H) return 2;
-  uint16_t frames = rd16(g_buf + 6);
-  uint16_t ncol = rd16(g_buf + 8);
+// フラッシュ上のデータの CRC を計算する
+static uint32_t flash_crc(uint32_t addr, uint32_t n) {
+  uint32_t c = 0xFFFFFFFFu;
+  while (n > 0) {
+    uint32_t k = n < sizeof(g_fbuf) ? n : sizeof(g_fbuf);
+    fl_read(addr, g_fbuf, k);
+    c = crc32_update(c, g_fbuf, k);
+    addr += k; n -= k;
+  }
+  return c ^ 0xFFFFFFFFu;
+}
+
+// フラッシュ上のアニメの形式を確かめ、パレットと再生位置を準備する
+static uint8_t parse_anim(uint32_t total) {
+  uint8_t h[12];
+  if (total < 12) return 2;
+  fl_read(FLASH_DATA_ADDR, h, 12);
+  if (memcmp(h, "GA01", 4) != 0 || h[4] != SCR_W || h[5] != SCR_H) return 2;
+  uint16_t frames = rd16(h + 6);
+  uint16_t ncol = rd16(h + 8);
   if (frames == 0 || ncol == 0 || ncol > 256) return 2;
   uint32_t pos = 12 + (uint32_t)ncol * 2;
   if (pos > total) return 2;
+  uint8_t pb[512];
+  fl_read(FLASH_DATA_ADDR + 12, pb, ncol * 2);
   memset(g_pal, 0, sizeof(g_pal));
-  for (uint16_t i = 0; i < ncol; i++) g_pal[i] = rd16(g_buf + 12 + i * 2);
+  for (uint16_t i = 0; i < ncol; i++) g_pal[i] = rd16(pb + i * 2);
   uint32_t start = pos;
   for (uint16_t f = 0; f < frames; f++) {
     if (pos + 4 > total) return 2;
-    pos += 4 + rd16(g_buf + pos + 2);
+    uint8_t fh[4];
+    fl_read(FLASH_DATA_ADDR + pos, fh, 4);
+    uint16_t len = rd16(fh + 2);
+    if (len > FRAME_MAX) return 2;
+    pos += 4 + len;
   }
   if (pos != total) return 2;
+  g_total = total;
   g_frames = frames;
-  g_framesStart = start;
-  g_framePos = start;
+  g_framesStart = FLASH_DATA_ADDR + start;
+  g_framePos = g_framesStart;
   g_frameNo = 0;
   g_nextAt = millis();
-  g_forceFull = true;   // 画面には受信中の表示が出ているので最初は全部描く
+  g_forceFull = true;
   return 0;
+}
+
+// 起動時: 保存されているアニメがあれば再生する
+static bool load_saved_anim() {
+  uint8_t h[12];
+  fl_read(FLASH_HDR_ADDR, h, sizeof(h));
+  if (memcmp(h, "GAF1", 4) != 0) return false;
+  uint32_t total = rd32(h + 4), crc = rd32(h + 8);
+  if (total == 0 || total > flash_max_bytes()) return false;
+  screen_message("Loading...", "", 0x07FF);
+  uint32_t t0 = millis();
+  if (flash_crc(FLASH_DATA_ADDR, total) != crc) { Serial.println("saved anim: CRC NG"); return false; }
+  if (parse_anim(total) != 0) { Serial.println("saved anim: format NG"); return false; }
+  Serial.printf("saved anim: %lu bytes, %u frames (check %lu ms)\n",
+                (unsigned long)total, g_frames, (unsigned long)(millis() - t0));
+  return true;
 }
 
 // 差分データを g_idx に展開し、書き換わった画素範囲を返す
@@ -299,8 +478,7 @@ static uint8_t g_tx[SCR_W * TILE * 2];
 #endif
 
 // g_idx と g_shown を比べて、変化した 8x8 タイルを含む部分だけを OLED に送る。
-// 8 行の帯ごとに「左端の変化タイル〜右端の変化タイル」を 1 つの矩形にする
-// (矩形を分けると 1 個あたりのコマンド送信の手間の方が大きいため)。
+// 8 行の帯ごとに「左端の変化タイル〜右端の変化タイル」を 1 つの矩形にする。
 // 戻り値は送った画素数。
 static uint32_t push_dirty_tiles(int y0, int y1, bool full) {
   uint32_t pixels = 0;
@@ -349,27 +527,28 @@ static uint32_t push_dirty_tiles(int y0, int y1, bool full) {
 }
 
 static void play_next_frame() {
-  uint32_t total = g_total;
+  static uint32_t statFrames = 0, statPixels = 0, statUs = 0, statReadUs = 0, statAt = 0, statLate = 0, statMaxLate = 0;
+  uint32_t late = millis() - g_nextAt;   // 予定時刻からの遅れ
+  if (late > statMaxLate) statMaxLate = late;
+  if (late > 10) statLate++;
+
   if (g_frameNo == 0) {
     memset(g_idx, 0, sizeof(g_idx));
     g_framePos = g_framesStart;
   }
-  if (g_framePos + 4 > total) { g_frameNo = 0; return; }
-  uint16_t delayMs = rd16(g_buf + g_framePos);
-  uint16_t len = rd16(g_buf + g_framePos + 2);
-  if (g_framePos + 4 + len > total) { g_frameNo = 0; return; }
+  uint32_t tr = micros();
+  uint8_t fh[4];
+  fl_read(g_framePos, fh, 4);
+  uint16_t delayMs = rd16(fh);
+  uint16_t len = rd16(fh + 2);
+  if (len > FRAME_MAX) { g_frameNo = 0; return; }
+  fl_read(g_framePos + 4, g_fbuf, len);
+  statReadUs += micros() - tr;
 
   int32_t pmin = NPIX, pmax = -1;
-  decode_frame(g_buf + g_framePos + 4, len, pmin, pmax);
+  decode_frame(g_fbuf, len, pmin, pmax);
   // ループ先頭は「全画素0から」展開し直すので、範囲は画面全体と比べる
   if (g_frameNo == 0 || g_forceFull) { pmin = 0; pmax = NPIX - 1; }
-  if (g_state != ST_PLAYING) return;                    // 受信が始まったら描かない
-
-  static uint32_t statFrames = 0, statPixels = 0, statUs = 0, statAt = 0, statLate = 0, statMaxLate = 0;
-  // 予定時刻からどれだけ遅れて描き始めたか (描画が間に合っていれば 0〜数ms)
-  uint32_t late = millis() - g_nextAt;
-  if (late > statMaxLate) statMaxLate = late;
-  if (late > 10) statLate++;
   if (pmax >= pmin) {
     uint32_t t0 = micros();
     statPixels += push_dirty_tiles(pmin / SCR_W, pmax / SCR_W, g_forceFull);
@@ -378,12 +557,12 @@ static void play_next_frame() {
   }
   if (++statFrames >= 50 || millis() - statAt > 5000) {
     // ns/px: 1画素を送るのにかかった時間。SPI 8MHz の理論値は 16bit = 2000ns
-    Serial.printf("draw: %lu frames, avg %lu px / %lu us per frame, %lu ns/px, late>10ms %lu, max late %lu ms\n",
+    Serial.printf("draw: %lu frames, avg %lu px / %lu us draw / %lu us flash read, %lu ns/px, late>10ms %lu, max late %lu ms\n",
                   (unsigned long)statFrames, (unsigned long)(statPixels / statFrames),
-                  (unsigned long)(statUs / statFrames),
+                  (unsigned long)(statUs / statFrames), (unsigned long)(statReadUs / statFrames),
                   (unsigned long)(statPixels ? (uint64_t)statUs * 1000 / statPixels : 0),
                   (unsigned long)statLate, (unsigned long)statMaxLate);
-    statFrames = statPixels = statUs = statLate = statMaxLate = 0;
+    statFrames = statPixels = statUs = statReadUs = statLate = statMaxLate = 0;
     statAt = millis();
   }
 
@@ -396,77 +575,31 @@ static void play_next_frame() {
   if ((int32_t)(now - g_nextAt) > 200) g_nextAt = now;  // 大きく遅れたら追いつくのをやめる
 }
 
-// ---------------- Arduino ----------------
-void setup() {
-  Serial.begin(115200);
-  crc_init();
-  display.begin(SPI_HZ);
-  display.fillScreen(0x0000);
+// ---------------- 受信処理 (loop から呼ぶ) ----------------
+static void set_state(uint8_t st) {
+  g_state = st;
   g_uiDirty = true;
 }
 
-void loop() {
-  static uint8_t shownState = 0xff;
-  static uint8_t shownConn = 0xfe;
-
-  flush_notifications();
-
-  uint8_t st = g_state;
-  if (st == ST_RECEIVING) {
-    static uint32_t lastStat = 0;
-    if (millis() - lastStat >= 1000) {
-      lastStat = millis();
-      Serial.printf("rx %lu/%lu  dup %lu gap %lu notifyFail %lu\n",
-                    (unsigned long)g_received, (unsigned long)g_total,
-                    (unsigned long)g_statDup, (unsigned long)g_statGap, (unsigned long)g_statNotifyFail);
-    }
-  }
-  if (g_uiDirty || st != shownState || (st == ST_IDLE && g_conn != shownConn)) {
-    g_uiDirty = false;
-    shownState = st;
-    shownConn = g_conn;
-    screen_status();
-  }
-
-  if (st == ST_RECEIVING) {
-    screen_progress_update();
-  } else if (st == ST_VERIFY) {
-    uint8_t r = verify_and_parse();
-    Serial.printf("verify: %u (%lu bytes, %u frames)\n", r, (unsigned long)g_total, g_frames);
-    if (r == 0) {
-      g_state = ST_PLAYING;
-      shownState = ST_PLAYING;
-    } else {
-      g_errorCode = r;
-      g_state = ST_ERROR;
-    }
-    g_donePending = r;
-  } else if (st == ST_PLAYING) {
-    if ((int32_t)(millis() - g_nextAt) >= 0) play_next_frame();
-  }
-  delay(1);
-}
-
-// ---------------- BLE ----------------
-static void on_rx(const uint8_t *d, uint8_t len) {
+static void handle_packet(const uint8_t *d, uint8_t len) {
   if (len == 0) return;
   switch (d[0]) {
     case 0x01: {  // BEGIN
       if (len < 5) return;
       uint32_t total = rd32(d + 1);
-      if (total == 0 || total > BUF_SIZE) {
-        g_errorCode = 3;
-        g_state = ST_ERROR;
-        g_donePending = 3;
-        return;
+      if (!g_flashSize) { g_errorCode = 4; set_state(ST_ERROR); g_donePending = 4; return; }
+      if (total == 0 || total > flash_max_bytes()) {
+        g_errorCode = 3; set_state(ST_ERROR); g_donePending = 3; return;
       }
-      g_state = ST_RECEIVING;
+      fl_erase_sector(FLASH_HDR_ADDR);   // 保存済みのアニメを無効にする
       g_total = total;
       g_received = 0;
+      g_erasedUpTo = FLASH_DATA_ADDR;
       g_nakSent = false;
       g_nakPending = false;
       g_statDup = g_statGap = g_statNotifyFail = 0;
-      g_uiDirty = true;
+      g_rxOverflow = 0;
+      set_state(ST_RECEIVING);
       if (!send_ack(0x81, 0)) g_ackPending = true;
       break;
     }
@@ -474,13 +607,8 @@ static void on_rx(const uint8_t *d, uint8_t len) {
       if (len < 5 || g_state != ST_RECEIVING) return;
       uint32_t off = rd32(d + 1);
       uint32_t n = len - 5;
-      // 流量制御は PC 側の「応答ありの書き込み」で行うので、通常は ACK を返さない。
-      // 抜けたときだけ NAK でやり直し位置を知らせる。
-      if (off < g_received) {        // 受信済みの再送 → 捨てる
-        g_statDup++;
-        return;
-      }
-      if (off > g_received) {        // 抜けがあった → ここから送り直してと頼む
+      if (off < g_received) { g_statDup++; return; }   // 受信済みの再送 → 捨てる
+      if (off > g_received) {                          // 抜けがあった → 送り直してと頼む
         g_statGap++;
         if (!g_nakSent) {
           g_nakSent = true;
@@ -489,7 +617,12 @@ static void on_rx(const uint8_t *d, uint8_t len) {
         return;
       }
       if (off + n > g_total) n = g_total - off;
-      memcpy(g_buf + off, d + 5, n);
+      uint32_t a = FLASH_DATA_ADDR + off;
+      while (a + n > g_erasedUpTo) {                   // 書く前に 4KB ずつ消去
+        fl_erase_sector(g_erasedUpTo);
+        g_erasedUpTo += FLASH_SECTOR;
+      }
+      fl_program(a, d + 5, n);
       g_received = off + n;
       g_nakSent = false;
       break;
@@ -500,17 +633,115 @@ static void on_rx(const uint8_t *d, uint8_t len) {
         if (!send_ack(0x82, g_received)) g_nakPending = true;
         return;
       }
-      g_crcExpected = rd32(d + 1);
-      g_state = ST_VERIFY;
+      uint32_t crc = rd32(d + 1);
+      screen_message("Checking...", "", 0x07FF);
+      uint32_t t0 = millis();
+      uint8_t r = (flash_crc(FLASH_DATA_ADDR, g_total) == crc) ? 0 : 1;
+      if (r) {
+        uint8_t h[16];
+        fl_read(FLASH_DATA_ADDR, h, 16);
+        Serial.printf("CRC NG. head: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                      h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+      }
+      if (r == 0) r = parse_anim(g_total);
+      Serial.printf("verify: %u (%lu bytes, %u frames, %lu ms)\n", r, (unsigned long)g_total,
+                    g_frames, (unsigned long)(millis() - t0));
+      if (r == 0) {
+        uint8_t h[12] = { 'G', 'A', 'F', '1' };
+        wr32(h + 4, g_total);
+        wr32(h + 8, crc);
+        fl_program(FLASH_HDR_ADDR, h, sizeof(h));     // これで電源を切っても残る
+        g_state = ST_PLAYING;
+      } else {
+        g_errorCode = r;
+        set_state(ST_ERROR);
+      }
+      g_donePending = r;
       break;
     }
     case 0x04:  // STOP
-      g_state = ST_IDLE;
-      g_uiDirty = true;
+      set_state(ST_IDLE);
       break;
   }
 }
 
+static void process_rx_queue() {
+  while (g_rxTail != g_rxHead) {
+    RxPkt &p = g_rxq[g_rxTail];
+    handle_packet(p.data, p.len);
+    if (p.needResp) sl_bt_gatt_server_send_user_write_response(p.conn, h_rx, 0);
+    g_rxTail = (g_rxTail + 1) % RXQ_N;
+  }
+}
+
+// ---------------- Arduino ----------------
+void setup() {
+  Serial.begin(115200);
+  crc_init();
+  display.begin(SPI_HZ);
+  display.fillScreen(0x0000);
+
+  if (fl_init()) {
+    char msg[64];
+    bool ok = fl_selftest(msg, sizeof(msg));
+    Serial.printf("flash: id %02X %02X %02X, %lu KB, selftest %s: %s\n", g_flashId[0], g_flashId[1],
+                  g_flashId[2], (unsigned long)(g_flashSize / 1024), ok ? "OK" : "NG", msg);
+    char l1[24];
+    snprintf(l1, sizeof(l1), "Flash %luKB %s", (unsigned long)(g_flashSize / 1024), ok ? "OK" : "NG");
+    screen_message(l1, ok ? "" : "RW test failed", ok ? 0x07E0 : 0xF800);
+    delay(ok ? 800 : 5000);
+    if (load_saved_anim()) g_state = ST_PLAYING;
+  } else {
+    Serial.printf("flash: not found (id %02X %02X %02X)\n", g_flashId[0], g_flashId[1], g_flashId[2]);
+  }
+  ble_update_info();
+  g_uiDirty = true;
+}
+
+void loop() {
+  static uint8_t shownState = 0xff;
+  static uint8_t shownConn = 0xfe;
+
+  process_rx_queue();
+  flush_notifications();
+
+  // 受信中に切断されたら待ち受けに戻る
+  if (g_state == ST_RECEIVING && g_conn == 0xff) set_state(ST_IDLE);
+
+  if (g_state == ST_RECEIVING) {
+    // 1 秒ごとに: 受信速度と、そのうちフラッシュの消去・書き込みに使った時間
+    static uint32_t lastStat = 0, lastRx = 0, lastBusy = 0;
+    uint32_t now = millis();
+    if (now - lastStat >= 1000) {
+      if (g_received < lastRx) lastRx = 0;
+      Serial.printf("rx %lu/%lu  %lu B/s  flash busy %lu ms  dup %lu gap %lu overflow %lu notifyFail %lu\n",
+                    (unsigned long)g_received, (unsigned long)g_total,
+                    (unsigned long)((uint64_t)(g_received - lastRx) * 1000 / (now - lastStat)),
+                    (unsigned long)((g_flashBusyUs - lastBusy) / 1000),
+                    (unsigned long)g_statDup, (unsigned long)g_statGap, (unsigned long)g_rxOverflow,
+                    (unsigned long)g_statNotifyFail);
+      lastStat = now;
+      lastRx = g_received;
+      lastBusy = g_flashBusyUs;
+    }
+  }
+  uint8_t conn = g_conn;
+  if (g_uiDirty || g_state != shownState || (g_state == ST_IDLE && conn != shownConn)) {
+    g_uiDirty = false;
+    shownState = g_state;
+    shownConn = conn;
+    screen_status();
+  }
+
+  if (g_state == ST_RECEIVING) {
+    screen_progress_update();
+  } else if (g_state == ST_PLAYING) {
+    if ((int32_t)(millis() - g_nextAt) >= 0) play_next_frame();
+  }
+  if (g_rxTail == g_rxHead) delay(1);
+}
+
+// ---------------- BLE ----------------
 void sl_bt_on_event(sl_bt_msg_t *evt) {
   switch (SL_BT_MSG_ID(evt->header)) {
     case sl_bt_evt_system_boot_id:
@@ -524,9 +755,12 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
       g_conn = c;
       g_mtu = 23;
       ble_update_info();
-      // 速く転送したいので短い接続間隔 (7.5〜15ms) と 2M PHY を要求する
+      // 短い接続間隔 (7.5〜15ms)、2M PHY、長いリンク層パケット (251 バイト) を要求する。
+      // 実測 (Windows + Chrome): 15ms・1M PHY になり約 14KB/s。7.5ms 固定にしても
+      // Chrome の 1 回の書き込みに 17〜20ms かかるので速くならず、むしろ少し遅かった。
       sl_bt_connection_set_parameters(c, 6, 12, 0, 400, 0, 0xffff);
       sl_bt_connection_set_preferred_phy(c, 0x02, 0xff);
+      sl_bt_connection_set_data_length(c, 251, 2120);
       Serial.println("connected");
       break;
     }
@@ -535,9 +769,25 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
       Serial.println("disconnected");
       g_conn = 0xff;
       g_txNotify = false;
-      if (g_state == ST_RECEIVING) g_state = ST_IDLE;
-      g_uiDirty = (g_state != ST_PLAYING);
       ble_start_advertising();
+      break;
+
+    // 転送速度を左右する接続条件 (PC 側が実際に受け入れた値) を表示する
+    case sl_bt_evt_connection_parameters_id:
+      Serial.printf("conn interval %u.%02u ms, latency %u, timeout %u ms\n",
+                    evt->data.evt_connection_parameters.interval * 125 / 100,
+                    evt->data.evt_connection_parameters.interval * 125 % 100,
+                    evt->data.evt_connection_parameters.latency,
+                    evt->data.evt_connection_parameters.timeout * 10);
+      break;
+    case sl_bt_evt_connection_phy_status_id:
+      Serial.printf("PHY %s\n", evt->data.evt_connection_phy_status.phy == 2 ? "2M" :
+                                evt->data.evt_connection_phy_status.phy == 1 ? "1M" : "coded");
+      break;
+    case sl_bt_evt_connection_data_length_id:
+      Serial.printf("data length tx %u / rx %u bytes\n",
+                    evt->data.evt_connection_data_length.tx_data_len,
+                    evt->data.evt_connection_data_length.rx_data_len);
       break;
 
     case sl_bt_evt_gatt_mtu_exchanged_id:
@@ -554,12 +804,32 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
       break;
     }
 
-    case sl_bt_evt_gatt_server_attribute_value_id:
-      if (evt->data.evt_gatt_server_attribute_value.attribute == h_rx) {
-        on_rx(evt->data.evt_gatt_server_attribute_value.value.data,
-              evt->data.evt_gatt_server_attribute_value.value.len);
+    // RX はアプリ管理の値なので、書き込みはこのイベントで届く。ここではキューに積むだけ。
+    // 応答ありの書き込みには、キューに余裕があればすぐ、なければ loop() が処理後に応答する。
+    case sl_bt_evt_gatt_server_user_write_request_id: {
+      sl_bt_evt_gatt_server_user_write_request_t &w = evt->data.evt_gatt_server_user_write_request;
+      bool needResp = (w.att_opcode == sl_bt_gatt_write_request);
+      if (w.characteristic != h_rx) {
+        if (needResp) sl_bt_gatt_server_send_user_write_response(w.connection, w.characteristic, 0x0E);
+        break;
       }
+      uint8_t next = (g_rxHead + 1) % RXQ_N;
+      if (next == g_rxTail) {          // キューが一杯 (通常は起きない) → 捨てる。抜けは NAK で回復
+        g_rxOverflow++;
+        if (needResp) sl_bt_gatt_server_send_user_write_response(w.connection, h_rx, 0);
+        break;
+      }
+      RxPkt &p = g_rxq[g_rxHead];
+      p.len = w.value.len > sizeof(p.data) ? sizeof(p.data) : w.value.len;
+      memcpy(p.data, w.value.data, p.len);
+      uint8_t used = (uint8_t)((next + RXQ_N - g_rxTail) % RXQ_N);
+      bool respondNow = needResp && (RXQ_N - 1 - used) >= RESP_MIN_FREE;
+      p.needResp = needResp && !respondNow;
+      p.conn = w.connection;
+      g_rxHead = next;
+      if (respondNow) sl_bt_gatt_server_send_user_write_response(w.connection, h_rx, 0);
       break;
+    }
 
     default:
       break;
@@ -574,11 +844,12 @@ static bool notify(const uint8_t *data, uint8_t len) {
 }
 
 static void ble_update_info() {
+  if (!h_info) return;
   uint8_t v[9];
   v[0] = PROTO_VER;
   v[1] = g_mtu & 0xff;
   v[2] = g_mtu >> 8;
-  wr32(v + 3, BUF_SIZE);
+  wr32(v + 3, flash_max_bytes());
   v[7] = SCR_W;
   v[8] = SCR_H;
   sl_bt_gatt_server_write_attribute_value(h_info, 0, sizeof(v), v);
@@ -636,10 +907,11 @@ static void ble_init_gatt_db() {
   app_assert_status(sc);
 
   uint8_t zero[9] = { 0 };
+  // RX: アプリ管理の値 (書き込みは user_write_request イベントで届き、応答はアプリが返す)
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id, h_service,
                                                SL_BT_GATTDB_CHARACTERISTIC_WRITE | SL_BT_GATTDB_CHARACTERISTIC_WRITE_NO_RESPONSE,
                                                0, 0, make_uuid(0x1001),
-                                               sl_bt_gattdb_variable_length_value, 244, 1, zero, &h_rx);
+                                               sl_bt_gattdb_user_managed_value, 244, 0, zero, &h_rx);
   app_assert_status(sc);
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id, h_service,
                                                SL_BT_GATTDB_CHARACTERISTIC_NOTIFY,
