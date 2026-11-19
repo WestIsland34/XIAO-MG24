@@ -28,6 +28,11 @@
   header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
            display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 17px; margin: 0; margin-right: auto; }
+  header h1 .ver { font-size: 12px; font-weight: normal; color: var(--muted); margin-left: 6px; }
+  .item .noimg { width: 100%; aspect-ratio: 3 / 2; background: #000; border-radius: 4px; color: #888;
+                 display: flex; align-items: center; justify-content: center; font-size: 11px; }
+  .item .sub { font-size: 11px; color: var(--muted); }
+  button.on { border-color: var(--accent); background: var(--sel); }
   main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; max-width: 1200px; margin: 0 auto; }
   @media (max-width: 820px) { main { grid-template-columns: minmax(0, 1fr); } }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
@@ -63,22 +68,24 @@
 </head>
 <body>
 <header>
-  <h1>XIAO MG24 GIF Player</h1>
+  <h1>XIAO MG24 GIF Player <span id="ver" class="ver"></span></h1>
   <span id="bleStatus" class="status">未接続</span>
   <button id="btnConnect" class="primary">XIAO に接続</button>
 </header>
 <div id="warn" class="warn" hidden></div>
 <main>
   <section>
-    <h2>GIF フォルダ</h2>
+    <h2>GIF 一覧</h2>
     <div class="row">
+      <button id="btnDefault" title="GitHub の GIF フォルダにある GIF">ディフォルト</button>
       <button id="btnFolder">フォルダを選ぶ</button>
+      <button id="btnCache" title="XIAO のフラッシュに残っている GIF (接続が必要)">キャッシュを選ぶ</button>
       <button id="btnLastFolder" hidden></button>
       <button id="btnReload" hidden>再読み込み</button>
       <span id="folderName" class="status"></span>
       <input id="dirInput" type="file" webkitdirectory multiple hidden>
     </div>
-    <div id="list" class="grid"><div class="empty">フォルダを選ぶと GIF が一覧表示されます</div></div>
+    <div id="list" class="grid"><div class="empty">「ディフォルト」「フォルダを選ぶ」「キャッシュを選ぶ」のどれかを押すと GIF が一覧表示されます</div></div>
   </section>
 
   <section>
@@ -111,6 +118,8 @@
 
 <script>
 'use strict';
+const APP_VERSION = '1.1.0';
+const REPO = 'WestIsland34/XIAO-MG24';   // 「ディフォルト」で GIF フォルダを読むリポジトリ
 // ===== 定数 (BLE_GIF_Player.ino と合わせる) =====
 const W = 96, H = 64, NPIX = W * H;
 const SVC  = '7e4a1000-5c3b-4f6e-9a21-3d8b6c0f1a20';
@@ -354,10 +363,19 @@ function startPreview(anim) {
   step();
 }
 
-// ===== フォルダと一覧 =====
-let files = [];          // { name, file }
+// ===== 一覧 (ディフォルト / フォルダ / キャッシュ) =====
+// files の要素: { name, file?, url?, cache?: { id, size, crc } }
+//   file  : GIF の中身 (Blob)。ディフォルトは選んだときに url から読む
+//   cache : XIAO のフラッシュに残っているアニメ (送らずに番号で再生する)
+let files = [];
+let mode = '';           // 'default' | 'folder' | 'cache'
 let selected = -1, playingIdx = -1;
 const animCache = new Map();
+
+$('ver').textContent = `v${APP_VERSION}`;
+function showVersion() {
+  $('ver').textContent = `Web v${APP_VERSION}` + (device.fw ? ` / XIAO v${device.fw}` : '');
+}
 
 async function readDirHandle(dir) {
   const out = [];
@@ -366,24 +384,43 @@ async function readDirHandle(dir) {
   }
   return out;
 }
-function setFiles(list, label) {
-  files = list.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }));
-  animCache.clear(); selected = -1; playingIdx = -1;
+function setFiles(list, label, newMode, sort = true) {
+  files = sort ? list.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true })) : list;
+  mode = newMode;
+  animCache.clear(); selected = -1; playingIdx = files.findIndex(f => f.cache && f.cache.playing);
   $('folderName').textContent = `${label} — ${files.length} 個の GIF`;
+  $('btnReload').hidden = mode === 'default';
+  for (const [id, m] of [['btnDefault', 'default'], ['btnFolder', 'folder'], ['btnCache', 'cache']]) $(id).classList.toggle('on', mode === m);
   renderList();
+  updateButtons();
 }
 function renderList() {
   const el = $('list');
-  el.querySelectorAll('img').forEach(i => URL.revokeObjectURL(i.src));
+  el.querySelectorAll('img').forEach(i => { if (i.src.startsWith('blob:')) URL.revokeObjectURL(i.src); });
   el.innerHTML = '';
-  if (!files.length) { el.innerHTML = '<div class="empty">GIF が見つかりませんでした</div>'; return; }
+  if (!files.length) {
+    el.innerHTML = `<div class="empty">${mode === 'cache' ? 'XIAO にキャッシュされた GIF はまだありません' : 'GIF が見つかりませんでした'}</div>`;
+    return;
+  }
   files.forEach((f, i) => {
     const d = document.createElement('div');
     d.className = 'item' + (i === selected ? ' sel' : '') + (i === playingIdx ? ' playing' : '');
     d.title = f.name;
-    const img = document.createElement('img'); img.src = URL.createObjectURL(f.file); img.alt = f.name; img.loading = 'lazy';
+    let thumb;
+    if (f.file || f.url) {
+      thumb = document.createElement('img');
+      thumb.src = f.file ? URL.createObjectURL(f.file) : f.url;
+      thumb.alt = f.name; thumb.loading = 'lazy';
+    } else {
+      thumb = document.createElement('div'); thumb.className = 'noimg'; thumb.textContent = 'プレビューなし';
+    }
     const n = document.createElement('div'); n.className = 'name'; n.textContent = f.name;
-    d.append(img, n);
+    d.append(thumb, n);
+    if (f.cache) {
+      const s = document.createElement('div'); s.className = 'sub';
+      s.textContent = `#${f.cache.id} · ${(f.cache.size / 1024).toFixed(1)} KB`;
+      d.append(s);
+    }
     d.onclick = () => select(i);
     d.ondblclick = () => select(i).then(() => sendSelected());
     el.append(d);
@@ -396,45 +433,94 @@ function markItems() {
   });
 }
 
+async function fileOf(f) {
+  if (!f.file && f.url) {
+    const r = await fetch(f.url);
+    if (!r.ok) throw new Error(`ダウンロードできません (${r.status})`);
+    f.file = await r.blob();
+  }
+  return f.file;
+}
 async function getAnim(i) {
   const fit = $('fit').value;
   const key = `${i}:${fit}:${device.bufSize}`;
   if (animCache.has(key)) return animCache.get(key);
   const t0 = performance.now();
-  const frames = await decodeGif(files[i].file, fit);
+  const frames = await decodeGif(await fileOf(files[i]), fit);
   const anim = buildAnimation(frames, device.bufSize);
+  anim.crc = crc32(anim.buf);
   anim.ms = Math.round(performance.now() - t0);
   animCache.set(key, anim);
   return anim;
 }
 async function select(i) {
-  selected = i; markItems();
+  selected = i; markItems(); updateButtons();
+  const f = files[i];
+  if (f.cache) {
+    // キャッシュは XIAO の中身をそのまま再生する。プレビューは PC に残っている元の GIF から作る
+    $('meta').textContent = `XIAO のキャッシュ #${f.cache.id}: ${f.name} (${(f.cache.size / 1024).toFixed(1)} KB)`
+      + (f.file ? '' : ' — この PC には元の GIF が無いのでプレビューできません');
+    if (!f.file) { clearTimeout(previewTimer); $('preview').getContext('2d').clearRect(0, 0, W, H); return; }
+    try { startPreview(await getAnim(i)); } catch {}
+    return;
+  }
   $('meta').textContent = '変換中…';
   try {
     const a = await getAnim(i);
     if (selected !== i) return;
-    $('meta').textContent = `${files[i].name}: ${a.frames} フレーム / ${a.colors} 色 / ${(a.buf.length / 1024).toFixed(1)} KB`
+    $('meta').textContent = `${f.name}: ${a.frames} フレーム / ${a.colors} 色 / ${(a.buf.length / 1024).toFixed(1)} KB`
       + (a.dropped ? ` (容量オーバーのため ${a.dropped} フレーム間引き)` : '')
       + (a.tooLarge ? ' ※それでも大きすぎます' : '');
     startPreview(a);
     updateButtons();
   } catch (e) {
     $('meta').textContent = `変換できませんでした: ${e.message}`;
-    log(`変換エラー ${files[i].name}: ${e.message}`);
+    log(`変換エラー ${f.name}: ${e.message}`);
   }
 }
 
-// IndexedDB に前回のフォルダを覚えておく
+// IndexedDB: 前回のフォルダと、XIAO に送った GIF の元ファイル (キャッシュ一覧のプレビュー用)
 const idb = (mode, fn) => new Promise((res, rej) => {
   const r = indexedDB.open('xiao-gif', 1);
   r.onupgradeneeded = () => r.result.createObjectStore('kv');
   r.onsuccess = () => { const tx = r.result.transaction('kv', mode); const q = fn(tx.objectStore('kv')); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); };
   r.onerror = () => rej(r.error);
 });
+const gifKey = crc => 'gif:' + crc.toString(16).padStart(8, '0');
+
+// ---- ディフォルト: GitHub の GIF フォルダ ----
+$('btnDefault').onclick = async () => {
+  try {
+    $('folderName').textContent = 'GitHub から一覧を読み込み中…';
+    let list = null;
+    try { list = JSON.parse(sessionStorage.getItem('defaultList')); } catch {}
+    if (!list) {
+      // 一覧は GitHub API で取る。API は IP ごとに 1 時間 60 回までなので、会社などで
+      // 使い切っていたら jsDelivr (少し古いことがある) で取る。中身は raw.githubusercontent.com から読む。
+      const raw = name => `https://raw.githubusercontent.com/${REPO}/main/GIF/${encodeURIComponent(name)}`;
+      try {
+        const r = await fetch(`https://api.github.com/repos/${REPO}/contents/GIF?ref=main`);
+        if (!r.ok) throw new Error(`GitHub API ${r.status}`);
+        list = (await r.json()).filter(x => x.type === 'file' && /\.gif$/i.test(x.name)).map(x => x.name);
+      } catch (e) {
+        const r = await fetch(`https://data.jsdelivr.com/v1/packages/gh/${REPO}@main?structure=flat`);
+        if (!r.ok) throw new Error(`${e.message} / jsDelivr ${r.status}`);
+        list = (await r.json()).files.map(f => f.name).filter(n => /^\/GIF\/[^/]+\.gif$/i.test(n)).map(n => n.slice(5));
+      }
+      list = list.map(name => ({ name, url: raw(name) }));
+      try { sessionStorage.setItem('defaultList', JSON.stringify(list)); } catch {}
+    }
+    setFiles(list.map(x => ({ ...x })), 'ディフォルト (GitHub の GIF フォルダ)', 'default');
+  } catch (e) {
+    $('folderName').textContent = '';
+    log(`ディフォルトの GIF を読めませんでした: ${e.message}`);
+  }
+};
+
+// ---- フォルダを選ぶ ----
 async function openDir(dir) {
-  setFiles(await readDirHandle(dir), dir.name);
-  $('btnReload').hidden = false;
-  $('btnReload').onclick = async () => setFiles(await readDirHandle(dir), dir.name);
+  setFiles(await readDirHandle(dir), dir.name, 'folder');
+  $('btnReload').onclick = async () => setFiles(await readDirHandle(dir), dir.name, 'folder');
   try { await idb('readwrite', s => s.put(dir, 'lastDir')); } catch {}
 }
 $('btnFolder').onclick = async () => {
@@ -445,7 +531,7 @@ $('btnFolder').onclick = async () => {
 $('dirInput').onchange = e => {
   const list = [...e.target.files].filter(f => /\.gif$/i.test(f.name)).map(f => ({ name: f.name, file: f }));
   const label = e.target.files[0] ? e.target.files[0].webkitRelativePath.split('/')[0] : '';
-  setFiles(list, label);
+  setFiles(list, label, 'folder');
 };
 (async () => {
   try {
@@ -458,18 +544,59 @@ $('dirInput').onchange = e => {
     };
   } catch {}
 })();
-$('fit').onchange = () => { if (selected >= 0) select(selected); };
+
+// ---- キャッシュを選ぶ: XIAO のフラッシュに残っている GIF ----
+async function loadCacheList() {
+  if (!connected()) { log('キャッシュを見るには先に XIAO に接続してください'); return; }
+  if (device.busy) return;
+  device.busy = true; updateButtons();
+  try {
+    events.length = 0;
+    await device.rx.writeValueWithResponse(new Uint8Array([0x05]));
+    const list = [];
+    for (;;) {
+      const ev = await nextEvent(5000);
+      if (!ev) throw new Error('一覧の応答がありません');
+      if (ev.code === 0x84) {
+        const d = ev.data, dv = new DataView(d.buffer);
+        const nameLen = d[14];
+        list.push({
+          name: new TextDecoder().decode(d.subarray(15, 15 + nameLen)) || '(名前なし)',
+          cache: { id: dv.getUint32(1, true), size: dv.getUint32(5, true), crc: dv.getUint32(9, true), playing: d[13] === 1 },
+        });
+      } else if (ev.code === 0x85) break;
+    }
+    list.sort((a, b) => b.cache.id - a.cache.id);   // 新しい順
+    // この PC に元の GIF が残っていればプレビューに使う。一覧に無いものは消す
+    try {
+      const keys = await idb('readonly', s => s.getAllKeys());
+      const want = new Set(list.map(f => gifKey(f.cache.crc)));
+      for (const k of keys) if (typeof k === 'string' && k.startsWith('gif:') && !want.has(k)) await idb('readwrite', s => s.delete(k));
+      for (const f of list) { const v = await idb('readonly', s => s.get(gifKey(f.cache.crc))); if (v) f.file = v.blob; }
+    } catch {}
+    setFiles(list, 'XIAO のキャッシュ', 'cache', false);
+    const used = list.reduce((a, f) => a + Math.ceil(f.cache.size / 4096) * 4096, 0);
+    $('folderName').textContent += ` (${(used / 1024 / 1024).toFixed(2)} / ${(device.bufSize / 1024 / 1024).toFixed(2)} MB 使用)`;
+  } catch (e) {
+    log(`キャッシュ一覧エラー: ${e.message}`);
+  } finally {
+    device.busy = false; updateButtons();
+  }
+}
+$('btnCache').onclick = loadCacheList;
+$('fit').onchange = () => { if (selected >= 0 && !files[selected].cache) select(selected); };
 
 // ===== Bluetooth =====
-const device = { dev: null, rx: null, tx: null, info: null, mtu: 23, bufSize: 4 * 1024 * 1024 - 4096, busy: false };   // 接続後に XIAO から読む
+const device = { dev: null, rx: null, tx: null, info: null, mtu: 23, bufSize: 4 * 1024 * 1024 - 12288, busy: false, fw: '' };   // 接続後に XIAO から読む
 let waiter = null;                          // 通知を待っている人
 const events = [];
 
+const DONE_MSG = ['OK', 'CRC 不一致', '形式エラー', 'サイズ超過', '外付けフラッシュが無い'];
 function onNotify(e) {
-  const v = new Uint8Array(e.target.value.buffer);
+  const v = new Uint8Array(e.target.value.buffer.slice(e.target.value.byteOffset, e.target.value.byteOffset + e.target.value.byteLength));
   const dv = new DataView(v.buffer);
-  const ev = { code: v[0], value: v.length >= 5 ? dv.getUint32(1, true) : v[1] };
-  if (ev.code === 0x83 && ev.value !== 0) log(`XIAO: エラー ${['OK', 'CRC 不一致', '形式エラー', 'サイズ超過'][ev.value] || ev.value}`);
+  const ev = { code: v[0], value: v.length >= 5 && v[0] < 0x83 ? dv.getUint32(1, true) : v[1], data: v };
+  if (ev.code === 0x83 && ev.value !== 0) log(`XIAO: エラー ${DONE_MSG[ev.value] || ev.value}`);
   events.push(ev);
   if (waiter) { const w = waiter; waiter = null; w(); }
 }
@@ -484,6 +611,7 @@ async function readInfo() {
   const dv = await device.info.readValue();
   device.mtu = dv.getUint16(1, true);
   device.bufSize = dv.getUint32(3, true);
+  device.fw = dv.byteLength >= 12 ? `${dv.getUint8(9)}.${dv.getUint8(10)}.${dv.getUint8(11)}` : '';
   return dv.getUint8(0);
 }
 
@@ -506,7 +634,9 @@ $('btnConnect').onclick = async () => {
     await device.tx.startNotifications();
     const ver = await readInfo();
     animCache.clear();
-    log(`接続: ${dev.name} (プロトコル v${ver}, MTU ${device.mtu}, 保存できる量 ${Math.round(device.bufSize / 1024)} KB)`);
+    showVersion();
+    log(`接続: ${dev.name} (本体 v${device.fw || '?'}, プロトコル v${ver}, MTU ${device.mtu}, 1 個の上限 ${Math.round(device.bufSize / 1024)} KB)`);
+    if (ver < 3) log('XIAO のファームウェアが古いので書き込み直してください (キャッシュ機能に未対応)');
     if (device.bufSize === 0) log('XIAO の外付けフラッシュが見つかりません');
     setStatus(`接続中: ${dev.name}`, 'ok');
     $('btnConnect').textContent = '切断';
@@ -528,19 +658,34 @@ function connected() { return !!(device.dev && device.dev.gatt.connected && devi
 function updateButtons() {
   $('btnSend').disabled = !connected() || selected < 0 || device.busy;
   $('btnStop').disabled = !connected() || device.busy;
+  $('btnCache').disabled = !connected() || device.busy;
 }
 
-async function sendAnimation(anim) {
+// 戻り値: true = XIAO のキャッシュにあったので送らずに済んだ
+async function sendAnimation(anim, name) {
   const buf = anim.buf, total = buf.length;
   await readInfo();                                  // MTU は接続後に変わることがある
   const chunk = Math.max(20, Math.min(device.mtu - 3, 244));
   const payload = chunk - 5;
   events.length = 0;
 
-  const begin = new Uint8Array(5); begin[0] = 0x01; new DataView(begin.buffer).setUint32(1, total, true);
+  // BEGIN: サイズ, CRC, 名前 (UTF-8 で 43 バイトまで。文字の途中で切らない)
+  let nameBytes = new TextEncoder().encode(name);
+  if (nameBytes.length > 43) {
+    let n = 43; while (n > 0 && (nameBytes[n] & 0xC0) === 0x80) n--;
+    nameBytes = nameBytes.subarray(0, n);
+  }
+  const begin = new Uint8Array(10 + nameBytes.length), bdv = new DataView(begin.buffer);
+  begin[0] = 0x01; bdv.setUint32(1, total, true); bdv.setUint32(5, anim.crc, true); begin[9] = nameBytes.length;
+  begin.set(nameBytes, 10);
   await device.rx.writeValueWithResponse(begin);
   let ev = await nextEvent(10000);
-  if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? (ev.value === 4 ? 'XIAO の外付けフラッシュが見つかりません' : 'XIAO 側の容量を超えています') : 'BEGIN に応答がありません');
+  if (ev && ev.code === 0x83 && ev.value === 0 && ev.data[2] === 1) {
+    $('progress').value = 1;
+    $('speed').textContent = 'XIAO のキャッシュにあったので送らずに再生しました';
+    return true;
+  }
+  if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? `XIAO: ${DONE_MSG[ev.value] || ev.value}` : 'BEGIN に応答がありません');
 
   const t0 = performance.now();
   let pos = 0, naks = 0, batch = BATCH, count = 0, pipe = PIPE;
@@ -572,7 +717,7 @@ async function sendAnimation(anim) {
       while (events.length) handle(events.shift());
       $('progress').value = pos / total;
     }
-    const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
+    const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, anim.crc, true);
     await device.rx.writeValueWithResponse(end);
     $('speed').textContent = 'XIAO で保存内容を確認中…';
     ev = await nextEvent(60000);   // フラッシュを読み直して CRC を確かめるので大きいと数秒かかる
@@ -585,21 +730,40 @@ async function sendAnimation(anim) {
   const sec = (performance.now() - t0) / 1000;
   $('speed').textContent = `${(total / 1024).toFixed(1)} KB を ${sec.toFixed(1)} 秒 (${(total / 1024 / sec).toFixed(1)} KB/s, パケット ${chunk} バイト)`;
   log(`転送 ${sec.toFixed(1)} 秒 / ${(total / 1024 / sec).toFixed(1)} KB/s / 抜け ${naks} 回 / 同時送信 ${pipe}`);
+  return false;
+}
+
+async function playCached(f) {
+  events.length = 0;
+  const m = new Uint8Array(5); m[0] = 0x06; new DataView(m.buffer).setUint32(1, f.cache.id, true);
+  await device.rx.writeValueWithResponse(m);
+  let ev = await nextEvent(5000);
+  while (ev && ev.code !== 0x86) ev = await nextEvent(5000);
+  if (!ev) throw new Error('再生の応答がありません');
+  if (ev.value !== 0) throw new Error(ev.value === 1 ? 'XIAO のキャッシュから消えています (一覧を開き直してください)' : '形式エラー');
 }
 
 async function sendIndex(i) {
   if (!connected() || device.busy) return;
   device.busy = true; updateButtons();
+  const f = files[i];
   try {
-    const anim = await getAnim(i);
-    if (anim.tooLarge) throw new Error('容量に収まりません');
-    log(`送信: ${files[i].name} (${anim.frames} フレーム, ${(anim.buf.length / 1024).toFixed(1)} KB)`);
-    $('progress').value = 0;
-    await sendAnimation(anim);
+    if (f.cache) {
+      await playCached(f);
+      log(`キャッシュから再生: #${f.cache.id} ${f.name}`);
+    } else {
+      const anim = await getAnim(i);
+      if (anim.tooLarge) throw new Error('容量に収まりません');
+      log(`送信: ${f.name} (${anim.frames} フレーム, ${(anim.buf.length / 1024).toFixed(1)} KB)`);
+      $('progress').value = 0;
+      const cached = await sendAnimation(anim, f.name);
+      log(cached ? 'XIAO のキャッシュにあったので送らずに再生' : '再生開始');
+      // 元の GIF をこの PC に残しておく (キャッシュ一覧のプレビュー用)
+      try { const blob = await fileOf(f); await idb('readwrite', s => s.put({ name: f.name, blob }, gifKey(anim.crc))); } catch {}
+    }
     playingIdx = i; markItems();
-    log('再生開始');
   } catch (e) {
-    log(`送信失敗: ${e.message}`);
+    log(`${f.cache ? '再生' : '送信'}失敗: ${e.message}`);
   } finally {
     device.busy = false; updateButtons();
   }
@@ -628,6 +792,7 @@ async function slideTick() {
   slideTimer = setTimeout(slideTick, Math.max(3, +$('interval').value || 15) * 1000);
 }
 $('slideshow').onchange = () => slideTick();
+updateButtons();
 </script>
 </body>
 </html>

@@ -4,7 +4,10 @@
  * PC のブラウザ (docs/index.html, Web Bluetooth) から送られてきた
  * GIF アニメ (96x64 / 256色に変換済み) を受信して XIAO 基板上の外付けフラッシュ
  * (SPI1, CS=PA6) に保存し、SSD1331 OLED でループ再生する。
- * 電源を入れ直しても、保存されているアニメを自動で再生する。
+ * 送ったアニメはフラッシュにキャッシュとして残り (古いものから上書き)、PC から
+ * 番号を指定するだけで再生できる。電源を入れ直すと、最後に再生したアニメを自動で再生する。
+ * 加速度センサー (XIAO MG24 Sense 内蔵 LSM6DS3TR-C) が 1 分間動きを感じないと
+ * 画面を消してスリープし、動かすと再開する。
  *
  * ボード         : Silicon Labs → Seeed Studio XIAO MG24 (Sense)
  * Protocol stack : BLE (Silabs)   ← None ではないので注意
@@ -17,17 +20,25 @@
  * ---- 通信プロトコル (リトルエンディアン) ----
  * Service  7e4a1000-5c3b-4f6e-9a21-3d8b6c0f1a20
  *   RX   ...1001  Write / Write Without Response  (PC → XIAO)
- *          0x01 BEGIN  u32 totalLen
+ *          0x01 BEGIN  u32 totalLen, u32 crc32, u8 nameLen, name (UTF-8, 最大 43 バイト)
+ *                      同じ CRC・サイズのアニメがキャッシュにあれば、受信せずにそれを
+ *                      再生して DONE (cached=1) を返す。
  *          0x02 DATA   u32 offset, payload...
  *          0x03 END    u32 crc32 (IEEE, 全データ)
  *          0x04 STOP
- *          PC は DATA を 4 個に 1 個「応答あり」で書き込み、その応答を待ってから
- *          次を送る。XIAO はフラッシュに書き終わってから応答を返す (= 流量制御)。
+ *          0x05 LIST   キャッシュの一覧を ENTRY ... LIST_END で返す
+ *          0x06 PLAY   u32 id   キャッシュのアニメを再生する
+ *          PC は DATA を 12 個に 1 個「応答あり」で書き込み、その応答を待ってから
+ *          次を送る。XIAO はキューが詰まっているときだけ処理後に応答する (= 流量制御)。
  *   TX   ...1002  Notify (XIAO → PC)
  *          0x81 ACK    u32 receivedBytes    (BEGIN の受付時)
  *          0x82 NAK    u32 expectedOffset   (抜けを検出。この位置から送り直して)
- *          0x83 DONE   u8 result (0=OK 1=CRC 2=FORMAT 3=TOO_LARGE 4=NO_FLASH)
- *   INFO ...1003  Read: u8 ver, u16 mtu, u32 maxBytes, u8 width, u8 height
+ *          0x83 DONE   u8 result (0=OK 1=CRC 2=FORMAT 3=TOO_LARGE 4=NO_FLASH), u8 cached
+ *          0x84 ENTRY  u32 id, u32 size, u32 crc, u8 playing, u8 nameLen, name
+ *          0x85 LIST_END u16 count
+ *          0x86 PLAYED u8 result (0=OK 1=見つからない 2=FORMAT)
+ *   INFO ...1003  Read: u8 protoVer, u16 mtu, u32 maxBytes, u8 width, u8 height,
+ *                       u8 fwMajor, u8 fwMinor, u8 fwPatch
  *
  * ---- アニメデータ形式 ----
  *   "GA01"(4) u8 w, u8 h, u16 frames, u16 nColors, u16 reserved,
@@ -41,10 +52,14 @@
  *   1枚目は「全画素 0」から の差分。
  *
  * ---- フラッシュの使い方 ----
- *   0x000000 : ヘッダ "GAF1"(4) u32 total, u32 crc32   (受信と検証が済んでから書く)
- *   0x001000 : アニメデータ本体 (受信しながら 4KB ずつ消去して書く)
+ *   0x000000, 0x001000 : 目録 (4KB ずつ 2 か所に交互に書く。seq が大きく CRC が正しい方が有効)
+ *              ヘッダ 64 バイト + 項目 64 バイト x 63 (id, addr, size, crc, name)
+ *   0x002000 : 「いま再生中の id」の記録 (4 バイトずつ追記。一杯になったら消去)
+ *   0x003000 〜: アニメデータ本体。4KB 単位で前から順に置き、端まで来たら先頭に戻って
+ *              古いものを上書きする (リングバッファ)。受信しながら 4KB ずつ消去して書く。
  */
 #include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1331.h>
 
@@ -74,7 +89,10 @@ Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
 #define SCR_H 64
 #define NPIX  (SCR_W * SCR_H)
 
-#define PROTO_VER  2
+#define FW_VER_MAJOR 1
+#define FW_VER_MINOR 1
+#define FW_VER_PATCH 0
+#define PROTO_VER  3
 static const char DEVICE_NAME[] = "XIAO-GIF";
 
 static uint8_t  g_idx[NPIX];          // 現在のフレーム (パレット番号)
@@ -91,8 +109,10 @@ static uint16_t g_line[SCR_W];
 // ---------------- 外付けフラッシュ (SPI1) ----------------
 #define FLASH_CS        21          // PA6 (pins_arduino.h の SS1)
 #define FLASH_HZ        8000000u
-#define FLASH_HDR_ADDR  0x000000u
-#define FLASH_DATA_ADDR 0x001000u
+#define DIR_ADDR_A      0x000000u
+#define DIR_ADDR_B      0x001000u
+#define CUR_ADDR        0x002000u   // 再生中 id の追記ログ
+#define FLASH_DATA_ADDR 0x003000u
 #define FLASH_SECTOR    4096u
 #define FLASH_PAGE      256u
 #define FRAME_MAX       8192u       // 1 フレームの差分データの上限 (実際は最大 6.3KB 程度)
@@ -102,6 +122,30 @@ static uint32_t g_flashSize = 0;    // 0 = 見つからない
 static uint8_t  g_flashId[3];
 static uint8_t  g_fbuf[FRAME_MAX];  // フレーム読み出し・CRC 計算用
 
+// ---------------- キャッシュの目録 ----------------
+#define DIR_MAX   63
+#define NAME_MAX  43
+struct DirEntry {       // 64 バイト。id == 0 は空き
+  uint32_t id, addr, size, crc, reserved;
+  uint8_t  nameLen;
+  char     name[NAME_MAX];
+};
+struct DirHdr {         // 64 バイト
+  char     magic[4];    // "GAD1"
+  uint32_t seq, writePtr, nextId, crc;
+  uint8_t  pad[44];
+};
+struct Dir {
+  DirHdr   h;
+  DirEntry e[DIR_MAX];
+};
+static_assert(sizeof(DirEntry) == 64 && sizeof(Dir) == 4096, "dir layout");
+static Dir      g_dir;
+static uint32_t g_curId = 0;        // いま再生中 (最後に再生した) アニメの id
+static uint16_t g_curPos = 0;       // 再生中 id ログの次の書き込み位置 (4 バイト単位)
+static int16_t  g_listPos = -1;     // LIST の送信位置 (-1 = 送っていない)
+static uint16_t g_listCount = 0;
+
 // ---------------- 状態 ----------------
 // 状態の変更とフラッシュの読み書きは loop() だけが行う。
 // BLE のイベント処理は受信パケットをキューに積むだけ。
@@ -110,15 +154,33 @@ static uint8_t  g_state = ST_IDLE;
 static uint32_t g_total = 0;
 static uint32_t g_received = 0;
 static uint32_t g_erasedUpTo = 0;   // ここ (フラッシュのアドレス) までは消去済み
+static uint32_t g_recvAddr = 0;     // 受信中のアニメを置くフラッシュのアドレス
+static uint32_t g_recvCrc = 0;
+static uint8_t  g_recvNameLen = 0;
+static char     g_recvName[NAME_MAX];
 static bool     g_nakSent = false;
 static bool     g_ackPending = false, g_nakPending = false;
 static int16_t  g_donePending = -1;
+static uint8_t  g_doneCached = 0;
+static int16_t  g_playedPending = -1;
 static uint32_t g_statDup = 0, g_statGap = 0, g_statNotifyFail = 0;
 static bool     g_uiDirty = true;
 static uint8_t  g_errorCode = 0;
 
 static volatile uint8_t  g_conn = 0xff;      // 接続ハンドル (0xff = 未接続)
 static volatile uint16_t g_mtu = 23;
+static volatile bool     g_bleActivity = false;  // BLE で何か操作があった (スリープ解除用)
+
+// ---------------- 加速度センサーとスリープ ----------------
+#define IMU_PWR       19        // PD5: IMU の電源
+#define IMU_ADDR      0x6A
+#define SLEEP_MS      60000u    // この時間動きがなければスリープ
+#define MOTION_TH     820       // 動いたとみなす変化 (1LSB = 0.061mg, 820 ≒ 0.05g)
+#define IMU_POLL_MS   50
+static bool     g_imuOk = false;
+static int16_t  g_accRef[3];         // 最後に「動いた」と判定したときの値
+static uint32_t g_lastActive = 0;    // 最後に動いた (または操作があった) 時刻
+static bool     g_sleeping = false;
 
 // 再生状態
 static uint16_t g_frames = 0;
@@ -288,8 +350,8 @@ static bool send_ack(uint8_t code, uint32_t v) {
   return notify(m, 5);
 }
 static bool send_done(uint8_t result) {
-  uint8_t m[2] = { 0x83, result };
-  return notify(m, 2);
+  uint8_t m[3] = { 0x83, result, g_doneCached };
+  return notify(m, 3);
 }
 static void flush_notifications() {
   if (g_nakPending) {
@@ -305,6 +367,31 @@ static void flush_notifications() {
     g_donePending = -1;
     if (!send_done((uint8_t)d)) g_donePending = d;
   }
+  if (g_playedPending >= 0) {
+    uint8_t m[2] = { 0x86, (uint8_t)g_playedPending };
+    if (notify(m, 2)) g_playedPending = -1;
+  }
+  // キャッシュの一覧を 1 項目ずつ送る (送れなければ次の loop でやり直す)
+  while (g_listPos >= 0) {
+    if (g_listPos >= DIR_MAX) {
+      uint8_t m[3] = { 0x85, (uint8_t)g_listCount, (uint8_t)(g_listCount >> 8) };
+      if (!notify(m, 3)) break;
+      g_listPos = -1;
+      break;
+    }
+    const DirEntry &e = g_dir.e[g_listPos];
+    if (e.id) {
+      uint8_t m[15 + NAME_MAX];
+      m[0] = 0x84;
+      wr32(m + 1, e.id); wr32(m + 5, e.size); wr32(m + 9, e.crc);
+      m[13] = (e.id == g_curId && g_state == ST_PLAYING) ? 1 : 0;
+      m[14] = e.nameLen;
+      memcpy(m + 15, e.name, e.nameLen);
+      if (!notify(m, 15 + e.nameLen)) break;
+      g_listCount++;
+    }
+    g_listPos++;
+  }
 }
 
 // ---------------- 画面 ----------------
@@ -313,7 +400,7 @@ static void screen_message(const char *l1, const char *l2, uint16_t color) {
   display.setTextSize(1);
   display.setTextColor(color);
   display.setCursor(2, 4);
-  display.print("BLE GIF Player");
+  display.print("GIF Player v"); display.print(FW_VER_MAJOR); display.print("."); display.print(FW_VER_MINOR);
   display.drawFastHLine(0, 14, SCR_W, 0x39E7);
   display.setTextColor(0xFFFF);
   display.setCursor(2, 22);
@@ -382,10 +469,10 @@ static uint32_t flash_crc(uint32_t addr, uint32_t n) {
 }
 
 // フラッシュ上のアニメの形式を確かめ、パレットと再生位置を準備する
-static uint8_t parse_anim(uint32_t total) {
+static uint8_t parse_anim(uint32_t base, uint32_t total) {
   uint8_t h[12];
   if (total < 12) return 2;
-  fl_read(FLASH_DATA_ADDR, h, 12);
+  fl_read(base, h, 12);
   if (memcmp(h, "GA01", 4) != 0 || h[4] != SCR_W || h[5] != SCR_H) return 2;
   uint16_t frames = rd16(h + 6);
   uint16_t ncol = rd16(h + 8);
@@ -393,14 +480,14 @@ static uint8_t parse_anim(uint32_t total) {
   uint32_t pos = 12 + (uint32_t)ncol * 2;
   if (pos > total) return 2;
   uint8_t pb[512];
-  fl_read(FLASH_DATA_ADDR + 12, pb, ncol * 2);
+  fl_read(base + 12, pb, ncol * 2);
   memset(g_pal, 0, sizeof(g_pal));
   for (uint16_t i = 0; i < ncol; i++) g_pal[i] = rd16(pb + i * 2);
   uint32_t start = pos;
   for (uint16_t f = 0; f < frames; f++) {
     if (pos + 4 > total) return 2;
     uint8_t fh[4];
-    fl_read(FLASH_DATA_ADDR + pos, fh, 4);
+    fl_read(base + pos, fh, 4);
     uint16_t len = rd16(fh + 2);
     if (len > FRAME_MAX) return 2;
     pos += 4 + len;
@@ -408,7 +495,7 @@ static uint8_t parse_anim(uint32_t total) {
   if (pos != total) return 2;
   g_total = total;
   g_frames = frames;
-  g_framesStart = FLASH_DATA_ADDR + start;
+  g_framesStart = base + start;
   g_framePos = g_framesStart;
   g_frameNo = 0;
   g_nextAt = millis();
@@ -416,20 +503,211 @@ static uint8_t parse_anim(uint32_t total) {
   return 0;
 }
 
-// 起動時: 保存されているアニメがあれば再生する
+// ---------------- キャッシュの目録 ----------------
+static uint32_t dir_crc(Dir &d) {
+  uint32_t save = d.h.crc;
+  d.h.crc = 0;
+  uint32_t c = crc32_update(0xFFFFFFFFu, (const uint8_t *)&d, sizeof(Dir)) ^ 0xFFFFFFFFu;
+  d.h.crc = save;
+  return c;
+}
+static bool dir_valid(Dir &d) {
+  if (memcmp(d.h.magic, "GAD1", 4) != 0 || d.h.crc != dir_crc(d)) return false;
+  for (int i = 0; i < DIR_MAX; i++) {
+    DirEntry &e = d.e[i];
+    if (e.id && (e.addr < FLASH_DATA_ADDR || e.addr + e.size > g_flashSize || e.nameLen > NAME_MAX)) e.id = 0;
+  }
+  return true;
+}
+static void dir_save() {
+  g_dir.h.seq++;
+  g_dir.h.crc = dir_crc(g_dir);
+  uint32_t a = (g_dir.h.seq & 1) ? DIR_ADDR_B : DIR_ADDR_A;   // 古い方に書く
+  fl_erase_sector(a);
+  fl_program(a, (const uint8_t *)&g_dir, sizeof(Dir));
+}
+static void dir_load() {
+  static_assert(sizeof(g_fbuf) >= sizeof(Dir), "fbuf");
+  Dir *tmp = (Dir *)g_fbuf;
+  fl_read(DIR_ADDR_A, (uint8_t *)&g_dir, sizeof(Dir));
+  bool okA = dir_valid(g_dir);
+  fl_read(DIR_ADDR_B, (uint8_t *)tmp, sizeof(Dir));
+  bool okB = dir_valid(*tmp);
+  if (okB && (!okA || tmp->h.seq > g_dir.h.seq)) {
+    memcpy(&g_dir, tmp, sizeof(Dir));
+  } else if (!okA) {
+    memset(&g_dir, 0, sizeof(Dir));
+    memcpy(g_dir.h.magic, "GAD1", 4);
+    g_dir.h.writePtr = FLASH_DATA_ADDR;
+    g_dir.h.nextId = 1;
+    Serial.println("cache: new directory");
+  }
+  // 再生中 id のログ: 最後に書かれた値を探す。その後ろが消去済みでなければ (古い形式の
+  // データが残っているなど) 追記できないので、消去してやり直す
+  fl_read(CUR_ADDR, g_fbuf, FLASH_SECTOR);
+  g_curPos = 0;
+  g_curId = 0;
+  for (uint16_t i = 0; i < FLASH_SECTOR / 4; i++) {
+    uint32_t v = rd32(g_fbuf + i * 4);
+    if (v == 0xFFFFFFFFu) break;
+    g_curId = v;
+    g_curPos = i + 1;
+  }
+  bool clean = true;
+  for (uint32_t i = g_curPos * 4; i < FLASH_SECTOR; i++) if (g_fbuf[i] != 0xFF) { clean = false; break; }
+  if (!clean || (!okA && !okB)) {
+    fl_erase_sector(CUR_ADDR);
+    g_curPos = 0;
+    g_curId = 0;
+  }
+}
+// 再生中の id を記録する。毎回目録を書き直すと消去回数が増えるので、別の領域に追記する
+static void cur_save(uint32_t id) {
+  if (id == g_curId) return;
+  if (g_curPos >= FLASH_SECTOR / 4) { fl_erase_sector(CUR_ADDR); g_curPos = 0; }
+  uint8_t b[4];
+  wr32(b, id);
+  fl_program(CUR_ADDR + g_curPos * 4, b, 4);
+  g_curPos++;
+  g_curId = id;
+}
+static int dir_find(uint32_t id) {
+  if (id == 0) return -1;
+  for (int i = 0; i < DIR_MAX; i++) if (g_dir.e[i].id == id) return i;
+  return -1;
+}
+static int dir_find_crc(uint32_t crc, uint32_t size) {
+  for (int i = 0; i < DIR_MAX; i++)
+    if (g_dir.e[i].id && g_dir.e[i].crc == crc && g_dir.e[i].size == size) return i;
+  return -1;
+}
+static uint32_t dir_count() {
+  uint32_t n = 0;
+  for (int i = 0; i < DIR_MAX; i++) if (g_dir.e[i].id) n++;
+  return n;
+}
+// 新しいアニメの置き場所を決め、重なる古いアニメを目録から消す
+static uint32_t dir_alloc(uint32_t total) {
+  uint32_t need = (total + FLASH_SECTOR - 1) / FLASH_SECTOR * FLASH_SECTOR;
+  uint32_t a = g_dir.h.writePtr;
+  if (a < FLASH_DATA_ADDR || a + need > g_flashSize) a = FLASH_DATA_ADDR;   // 端まで来たら先頭へ
+  bool changed = false;
+  for (int i = 0; i < DIR_MAX; i++) {
+    DirEntry &e = g_dir.e[i];
+    if (e.id && e.addr < a + need && a < e.addr + e.size) {
+      Serial.printf("cache: drop id %lu (%.*s)\n", (unsigned long)e.id, e.nameLen, e.name);
+      e.id = 0;
+      changed = true;
+    }
+  }
+  if (dir_count() >= DIR_MAX) {           // 項目が一杯 → いちばん古いものを消す
+    int oldest = -1;
+    for (int i = 0; i < DIR_MAX; i++)
+      if (g_dir.e[i].id && (oldest < 0 || g_dir.e[i].id < g_dir.e[oldest].id)) oldest = i;
+    g_dir.e[oldest].id = 0;
+    changed = true;
+  }
+  if (changed) dir_save();
+  return a;
+}
+
+// 目録の項目を再生する
+static uint8_t play_entry(int i) {
+  if (i < 0) return 1;
+  const DirEntry &e = g_dir.e[i];
+  uint8_t r = parse_anim(e.addr, e.size);
+  if (r) return r;
+  cur_save(e.id);
+  g_state = ST_PLAYING;
+  g_uiDirty = true;
+  Serial.printf("play: id %lu %.*s (%lu bytes, %u frames)\n", (unsigned long)e.id, e.nameLen, e.name,
+                (unsigned long)e.size, g_frames);
+  return 0;
+}
+
+// 起動時: 最後に再生していたアニメがあれば再生する
 static bool load_saved_anim() {
-  uint8_t h[12];
-  fl_read(FLASH_HDR_ADDR, h, sizeof(h));
-  if (memcmp(h, "GAF1", 4) != 0) return false;
-  uint32_t total = rd32(h + 4), crc = rd32(h + 8);
-  if (total == 0 || total > flash_max_bytes()) return false;
+  dir_load();
+  Serial.printf("cache: %lu anims, seq %lu, writePtr %06lX, current id %lu\n", (unsigned long)dir_count(),
+                (unsigned long)g_dir.h.seq, (unsigned long)g_dir.h.writePtr, (unsigned long)g_curId);
+  int i = dir_find(g_curId);
+  if (i < 0) return false;
+  DirEntry &e = g_dir.e[i];
   screen_message("Loading...", "", 0x07FF);
   uint32_t t0 = millis();
-  if (flash_crc(FLASH_DATA_ADDR, total) != crc) { Serial.println("saved anim: CRC NG"); return false; }
-  if (parse_anim(total) != 0) { Serial.println("saved anim: format NG"); return false; }
-  Serial.printf("saved anim: %lu bytes, %u frames (check %lu ms)\n",
-                (unsigned long)total, g_frames, (unsigned long)(millis() - t0));
+  if (flash_crc(e.addr, e.size) != e.crc) {
+    Serial.println("saved anim: CRC NG");
+    e.id = 0;
+    dir_save();
+    return false;
+  }
+  if (play_entry(i) != 0) { Serial.println("saved anim: format NG"); return false; }
+  Serial.printf("saved anim checked in %lu ms\n", (unsigned long)(millis() - t0));
   return true;
+}
+
+// ---------------- 加速度センサー (LSM6DS3TR-C, Wire1, 電源 PD5) ----------------
+static bool imu_write(uint8_t reg, uint8_t v) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.write(v);
+  return Wire1.endTransmission() == 0;
+}
+static bool imu_read(uint8_t reg, uint8_t *buf, uint8_t n) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  if (Wire1.endTransmission(false) != 0) return false;
+  if (Wire1.requestFrom((uint8_t)IMU_ADDR, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire1.read();
+  return true;
+}
+static bool imu_accel(int16_t a[3]) {
+  uint8_t b[6];
+  if (!imu_read(0x28, b, 6)) return false;     // OUTX_L_XL 〜 OUTZ_H_XL
+  for (int i = 0; i < 3; i++) a[i] = (int16_t)(b[i * 2] | (b[i * 2 + 1] << 8));
+  return true;
+}
+static bool imu_init() {
+  pinMode(IMU_PWR, OUTPUT);
+  digitalWrite(IMU_PWR, HIGH);
+  delay(20);
+  Wire1.begin();
+  Wire1.setClock(400000);
+  uint8_t who = 0;
+  if (!imu_read(0x0F, &who, 1) || (who != 0x6A && who != 0x69)) {
+    Serial.printf("imu: not found (WHO_AM_I %02X) - sleep disabled\n", who);
+    return false;
+  }
+  imu_write(0x12, 0x44);    // CTRL3_C: BDU=1, IF_INC=1
+  imu_write(0x10, 0x30);    // CTRL1_XL: 52Hz, ±2g
+  delay(50);
+  imu_accel(g_accRef);
+  Serial.printf("imu: LSM6DS3 (WHO_AM_I %02X) OK\n", who);
+  return true;
+}
+// 最後に動いたときの値から MOTION_TH 以上変わったら「動いた」(ゆっくり傾けても検出できる)
+static bool imu_moved() {
+  int16_t a[3];
+  if (!imu_accel(a)) return false;
+  for (int i = 0; i < 3; i++) {
+    if (abs((int32_t)a[i] - g_accRef[i]) > MOTION_TH) {
+      memcpy(g_accRef, a, sizeof(a));
+      return true;
+    }
+  }
+  return false;
+}
+static void enter_sleep() {
+  g_sleeping = true;
+  display.enableDisplay(false);     // 画面を消す (画面の中身は OLED 側に残る)
+  Serial.println("sleep");
+}
+static void leave_sleep() {
+  g_sleeping = false;
+  display.enableDisplay(true);
+  g_nextAt = millis();
+  g_uiDirty = true;
+  Serial.println("wake");
 }
 
 // 差分データを g_idx に展開し、書き換わった画素範囲を返す
@@ -585,16 +863,30 @@ static void handle_packet(const uint8_t *d, uint8_t len) {
   if (len == 0) return;
   switch (d[0]) {
     case 0x01: {  // BEGIN
-      if (len < 5) return;
+      g_doneCached = 0;
+      if (len < 10) { g_donePending = 2; return; }
       uint32_t total = rd32(d + 1);
+      uint32_t crc = rd32(d + 5);
+      uint8_t nameLen = d[9];
+      if (nameLen > NAME_MAX) nameLen = NAME_MAX;
+      if (10 + nameLen > len) nameLen = len - 10;
       if (!g_flashSize) { g_errorCode = 4; set_state(ST_ERROR); g_donePending = 4; return; }
       if (total == 0 || total > flash_max_bytes()) {
         g_errorCode = 3; set_state(ST_ERROR); g_donePending = 3; return;
       }
-      fl_erase_sector(FLASH_HDR_ADDR);   // 保存済みのアニメを無効にする
+      int hit = dir_find_crc(crc, total);
+      if (hit >= 0 && play_entry(hit) == 0) {    // キャッシュにある → 送ってもらわずに再生
+        g_doneCached = 1;
+        g_donePending = 0;
+        return;
+      }
+      g_recvCrc = crc;
+      g_recvNameLen = nameLen;
+      memcpy(g_recvName, d + 10, nameLen);
+      g_recvAddr = dir_alloc(total);
       g_total = total;
       g_received = 0;
-      g_erasedUpTo = FLASH_DATA_ADDR;
+      g_erasedUpTo = g_recvAddr;
       g_nakSent = false;
       g_nakPending = false;
       g_statDup = g_statGap = g_statNotifyFail = 0;
@@ -617,7 +909,7 @@ static void handle_packet(const uint8_t *d, uint8_t len) {
         return;
       }
       if (off + n > g_total) n = g_total - off;
-      uint32_t a = FLASH_DATA_ADDR + off;
+      uint32_t a = g_recvAddr + off;
       while (a + n > g_erasedUpTo) {                   // 書く前に 4KB ずつ消去
         fl_erase_sector(g_erasedUpTo);
         g_erasedUpTo += FLASH_SECTOR;
@@ -636,21 +928,33 @@ static void handle_packet(const uint8_t *d, uint8_t len) {
       uint32_t crc = rd32(d + 1);
       screen_message("Checking...", "", 0x07FF);
       uint32_t t0 = millis();
-      uint8_t r = (flash_crc(FLASH_DATA_ADDR, g_total) == crc) ? 0 : 1;
+      uint8_t r = (crc == g_recvCrc && flash_crc(g_recvAddr, g_total) == crc) ? 0 : 1;
       if (r) {
         uint8_t h[16];
-        fl_read(FLASH_DATA_ADDR, h, 16);
+        fl_read(g_recvAddr, h, 16);
         Serial.printf("CRC NG. head: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                       h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
       }
-      if (r == 0) r = parse_anim(g_total);
+      if (r == 0) r = parse_anim(g_recvAddr, g_total);
       Serial.printf("verify: %u (%lu bytes, %u frames, %lu ms)\n", r, (unsigned long)g_total,
                     g_frames, (unsigned long)(millis() - t0));
       if (r == 0) {
-        uint8_t h[12] = { 'G', 'A', 'F', '1' };
-        wr32(h + 4, g_total);
-        wr32(h + 8, crc);
-        fl_program(FLASH_HDR_ADDR, h, sizeof(h));     // これで電源を切っても残る
+        // 目録に登録する。これで電源を切っても残る (dir_alloc で空きは確保済み)
+        int slot = 0;
+        for (int i = 0; i < DIR_MAX; i++) if (!g_dir.e[i].id) { slot = i; break; }
+        DirEntry &e = g_dir.e[slot];
+        memset(&e, 0, sizeof(e));
+        e.id = g_dir.h.nextId++;
+        e.addr = g_recvAddr;
+        e.size = g_total;
+        e.crc = crc;
+        e.nameLen = g_recvNameLen;
+        memcpy(e.name, g_recvName, g_recvNameLen);
+        g_dir.h.writePtr = g_recvAddr + (g_total + FLASH_SECTOR - 1) / FLASH_SECTOR * FLASH_SECTOR;
+        dir_save();
+        cur_save(e.id);
+        Serial.printf("cache: saved id %lu at %06lX (%lu anims)\n", (unsigned long)e.id,
+                      (unsigned long)e.addr, (unsigned long)dir_count());
         g_state = ST_PLAYING;
       } else {
         g_errorCode = r;
@@ -662,6 +966,17 @@ static void handle_packet(const uint8_t *d, uint8_t len) {
     case 0x04:  // STOP
       set_state(ST_IDLE);
       break;
+    case 0x05:  // LIST
+      g_listPos = 0;
+      g_listCount = 0;
+      break;
+    case 0x06: {  // PLAY
+      if (len < 5 || g_state == ST_RECEIVING) { g_playedPending = 1; return; }
+      uint8_t r = play_entry(dir_find(rd32(d + 1)));
+      if (r) Serial.printf("play: id %lu failed (%u)\n", (unsigned long)rd32(d + 1), r);
+      g_playedPending = r;
+      break;
+    }
   }
 }
 
@@ -680,6 +995,9 @@ void setup() {
   crc_init();
   display.begin(SPI_HZ);
   display.fillScreen(0x0000);
+  Serial.printf("BLE GIF Player v%d.%d.%d\n", FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH);
+  g_imuOk = imu_init();
+  g_lastActive = millis();
 
   if (fl_init()) {
     char msg[64];
@@ -690,7 +1008,7 @@ void setup() {
     snprintf(l1, sizeof(l1), "Flash %luKB %s", (unsigned long)(g_flashSize / 1024), ok ? "OK" : "NG");
     screen_message(l1, ok ? "" : "RW test failed", ok ? 0x07E0 : 0xF800);
     delay(ok ? 800 : 5000);
-    if (load_saved_anim()) g_state = ST_PLAYING;
+    load_saved_anim();
   } else {
     Serial.printf("flash: not found (id %02X %02X %02X)\n", g_flashId[0], g_flashId[1], g_flashId[2]);
   }
@@ -704,6 +1022,29 @@ void loop() {
 
   process_rx_queue();
   flush_notifications();
+
+  // ---- スリープ: 1 分間動きも操作もなければ画面を消す。動かすか BLE で操作すると戻る ----
+  {
+    static uint32_t lastPoll = 0;
+    uint32_t now = millis();
+    bool active = false;
+    if (g_bleActivity) { g_bleActivity = false; active = true; }
+    if (g_state == ST_RECEIVING) active = true;
+    if (g_imuOk && now - lastPoll >= (g_sleeping ? 100u : IMU_POLL_MS)) {
+      lastPoll = now;
+      if (imu_moved()) active = true;
+    }
+    if (active) {
+      g_lastActive = now;
+      if (g_sleeping) leave_sleep();
+    } else if (g_imuOk && !g_sleeping && now - g_lastActive >= SLEEP_MS) {
+      enter_sleep();
+    }
+    if (g_sleeping) {
+      if (g_rxTail == g_rxHead) delay(20);
+      return;
+    }
+  }
 
   // 受信中に切断されたら待ち受けに戻る
   if (g_state == ST_RECEIVING && g_conn == 0xff) set_state(ST_IDLE);
@@ -753,6 +1094,7 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
     case sl_bt_evt_connection_opened_id: {
       uint8_t c = evt->data.evt_connection_opened.connection;
       g_conn = c;
+      g_bleActivity = true;
       g_mtu = 23;
       ble_update_info();
       // 短い接続間隔 (7.5〜15ms)、2M PHY、長いリンク層パケット (251 バイト) を要求する。
@@ -819,6 +1161,7 @@ void sl_bt_on_event(sl_bt_msg_t *evt) {
         if (needResp) sl_bt_gatt_server_send_user_write_response(w.connection, h_rx, 0);
         break;
       }
+      g_bleActivity = true;
       RxPkt &p = g_rxq[g_rxHead];
       p.len = w.value.len > sizeof(p.data) ? sizeof(p.data) : w.value.len;
       memcpy(p.data, w.value.data, p.len);
@@ -845,13 +1188,16 @@ static bool notify(const uint8_t *data, uint8_t len) {
 
 static void ble_update_info() {
   if (!h_info) return;
-  uint8_t v[9];
+  uint8_t v[12];
   v[0] = PROTO_VER;
   v[1] = g_mtu & 0xff;
   v[2] = g_mtu >> 8;
   wr32(v + 3, flash_max_bytes());
   v[7] = SCR_W;
   v[8] = SCR_H;
+  v[9] = FW_VER_MAJOR;
+  v[10] = FW_VER_MINOR;
+  v[11] = FW_VER_PATCH;
   sl_bt_gatt_server_write_attribute_value(h_info, 0, sizeof(v), v);
 }
 
@@ -906,7 +1252,7 @@ static void ble_init_gatt_db() {
                                 0, sizeof(svc), svc.data, &h_service);
   app_assert_status(sc);
 
-  uint8_t zero[9] = { 0 };
+  uint8_t zero[12] = { 0 };
   // RX: アプリ管理の値 (書き込みは user_write_request イベントで届き、応答はアプリが返す)
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id, h_service,
                                                SL_BT_GATTDB_CHARACTERISTIC_WRITE | SL_BT_GATTDB_CHARACTERISTIC_WRITE_NO_RESPONSE,
@@ -916,12 +1262,12 @@ static void ble_init_gatt_db() {
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id, h_service,
                                                SL_BT_GATTDB_CHARACTERISTIC_NOTIFY,
                                                0, 0, make_uuid(0x1002),
-                                               sl_bt_gattdb_variable_length_value, 20, 1, zero, &h_tx);
+                                               sl_bt_gattdb_variable_length_value, 244, 1, zero, &h_tx);
   app_assert_status(sc);
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id, h_service,
                                                SL_BT_GATTDB_CHARACTERISTIC_READ,
                                                0, 0, make_uuid(0x1003),
-                                               sl_bt_gattdb_fixed_length_value, 9, 9, zero, &h_info);
+                                               sl_bt_gattdb_fixed_length_value, 12, 12, zero, &h_info);
   app_assert_status(sc);
   sc = sl_bt_gattdb_start_service(gattdb_session_id, h_service);
   app_assert_status(sc);
