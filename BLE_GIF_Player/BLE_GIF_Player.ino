@@ -28,6 +28,13 @@
  *          0x04 STOP
  *          0x05 LIST   キャッシュの一覧を ENTRY ... LIST_END で返す
  *          0x06 PLAY   u32 id   キャッシュのアニメを再生する
+ *          ---- ライブ表示 (PC の画面をそのまま映す。フラッシュには書かない) ----
+ *          0x07 LIVE_START
+ *          0x08 LIVE_PAL   u8 start, u16 color (RGB565) ...   パレットの一部を設定
+ *          0x09 LIVE_DATA  u8 seq, u8 flags (bit0=キーフレーム), u16 offset, u16 total, data...
+ *                          1 コマ分の差分データ (アニメの frame data と同じ形式) を分割して送る。
+ *                          キーフレームは「全画素 0」からの差分。届いたらすぐ描く。
+ *          0x0A LIVE_END   ライブ表示をやめて、最後に再生していたアニメに戻る
  *          PC は DATA を 12 個に 1 個「応答あり」で書き込み、その応答を待ってから
  *          次を送る。XIAO はキューが詰まっているときだけ処理後に応答する (= 流量制御)。
  *   TX   ...1002  Notify (XIAO → PC)
@@ -37,6 +44,7 @@
  *          0x84 ENTRY  u32 id, u32 size, u32 crc, u8 playing, u8 nameLen, name
  *          0x85 LIST_END u16 count
  *          0x86 PLAYED u8 result (0=OK 1=見つからない 2=FORMAT)
+ *          0x87 NEED_KEY   ライブ表示のデータが抜けたので、次はキーフレームを送って
  *   INFO ...1003  Read: u8 protoVer, u16 mtu, u32 maxBytes, u8 width, u8 height,
  *                       u8 fwMajor, u8 fwMinor, u8 fwPatch
  *
@@ -90,9 +98,9 @@ Adafruit_SSD1331 display(OLED_CS, OLED_DC, OLED_MOSI, OLED_SCLK, OLED_RST);
 #define NPIX  (SCR_W * SCR_H)
 
 #define FW_VER_MAJOR 1
-#define FW_VER_MINOR 1
+#define FW_VER_MINOR 2
 #define FW_VER_PATCH 0
-#define PROTO_VER  3
+#define PROTO_VER  4
 static const char DEVICE_NAME[] = "XIAO-GIF";
 
 static uint8_t  g_idx[NPIX];          // 現在のフレーム (パレット番号)
@@ -149,7 +157,15 @@ static uint16_t g_listCount = 0;
 // ---------------- 状態 ----------------
 // 状態の変更とフラッシュの読み書きは loop() だけが行う。
 // BLE のイベント処理は受信パケットをキューに積むだけ。
-enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_PLAYING, ST_ERROR };
+enum : uint8_t { ST_IDLE, ST_RECEIVING, ST_PLAYING, ST_ERROR, ST_LIVE };
+
+// ライブ表示: 1 コマ分のデータを g_fbuf に集めてから描く
+static uint8_t  g_liveSeq = 0;
+static uint32_t g_liveLen = 0;
+static bool     g_liveBroken = false;   // このコマは途中が抜けた
+static bool     g_liveNeedKey = true;   // キーフレームが来るまで描かない
+static bool     g_needKeyPending = false;
+static uint32_t g_liveFrames = 0, g_liveBytes = 0, g_liveDrawUs = 0, g_liveDropped = 0;
 static uint8_t  g_state = ST_IDLE;
 static uint32_t g_total = 0;
 static uint32_t g_received = 0;
@@ -366,6 +382,10 @@ static void flush_notifications() {
     int16_t d = g_donePending;
     g_donePending = -1;
     if (!send_done((uint8_t)d)) g_donePending = d;
+  }
+  if (g_needKeyPending) {
+    uint8_t m[1] = { 0x87 };
+    if (notify(m, 1)) g_needKeyPending = false;
   }
   if (g_playedPending >= 0) {
     uint8_t m[2] = { 0x86, (uint8_t)g_playedPending };
@@ -859,6 +879,55 @@ static void set_state(uint8_t st) {
   g_uiDirty = true;
 }
 
+// ---------------- ライブ表示 ----------------
+static void live_packet(const uint8_t *d, uint8_t len) {
+  uint8_t seq = d[1], flags = d[2];
+  uint32_t off = rd16(d + 3), total = rd16(d + 5);
+  uint32_t n = len - 7;
+  if (off == 0) {                       // 新しいコマ
+    g_liveSeq = seq;
+    g_liveLen = 0;
+    g_liveBroken = false;
+  }
+  if (seq != g_liveSeq || off != g_liveLen || total > sizeof(g_fbuf) || off + n > total) {
+    if (!g_liveBroken) {                // 途中が抜けた → このコマは捨ててキーフレームを頼む
+      g_liveBroken = true;
+      g_liveDropped++;
+      g_liveNeedKey = true;
+      g_needKeyPending = true;
+    }
+    return;
+  }
+  if (g_liveBroken) return;
+  memcpy(g_fbuf + off, d + 7, n);
+  g_liveLen += n;
+  if (g_liveLen < total) return;
+
+  // 1 コマそろった
+  g_liveLen = 0;
+  bool key = flags & 1;
+  if (g_liveNeedKey && !key) return;    // キーフレーム待ち
+  g_liveNeedKey = false;
+  uint32_t t0 = micros();
+  int32_t pmin = NPIX, pmax = -1;
+  if (key) memset(g_idx, 0, sizeof(g_idx));
+  decode_frame(g_fbuf, total, pmin, pmax);
+  if (key || g_forceFull) { pmin = 0; pmax = NPIX - 1; }
+  if (pmax >= pmin) push_dirty_tiles(pmin / SCR_W, pmax / SCR_W, g_forceFull);
+  g_forceFull = false;
+  g_liveDrawUs += micros() - t0;
+  g_liveFrames++;
+  g_liveBytes += total;
+}
+// ライブ表示をやめて、最後に再生していたアニメに戻る
+static void live_end() {
+  Serial.println("live: end");
+  if (play_entry(dir_find(g_curId)) != 0) {
+    g_state = ST_IDLE;
+    g_uiDirty = true;
+  }
+}
+
 static void handle_packet(const uint8_t *d, uint8_t len) {
   if (len == 0) return;
   switch (d[0]) {
@@ -977,6 +1046,29 @@ static void handle_packet(const uint8_t *d, uint8_t len) {
       g_playedPending = r;
       break;
     }
+    case 0x07:  // LIVE_START
+      if (g_state == ST_RECEIVING) return;
+      g_state = ST_LIVE;
+      g_liveLen = 0;
+      g_liveBroken = false;
+      g_liveNeedKey = true;
+      g_liveFrames = g_liveBytes = g_liveDrawUs = g_liveDropped = 0;
+      memset(g_pal, 0, sizeof(g_pal));
+      Serial.println("live: start");
+      break;
+    case 0x08: {  // LIVE_PAL
+      if (len < 2 || g_state != ST_LIVE) return;
+      uint16_t start = d[1];
+      for (uint16_t i = 0; 2 + i * 2 + 1 < len && start + i < 256; i++) g_pal[start + i] = rd16(d + 2 + i * 2);
+      g_forceFull = true;   // 色が変わったので次は全画面を描く
+      break;
+    }
+    case 0x09:  // LIVE_DATA
+      if (len >= 7 && g_state == ST_LIVE) live_packet(d, len);
+      break;
+    case 0x0A:  // LIVE_END
+      if (g_state == ST_LIVE) live_end();
+      break;
   }
 }
 
@@ -1029,7 +1121,7 @@ void loop() {
     uint32_t now = millis();
     bool active = false;
     if (g_bleActivity) { g_bleActivity = false; active = true; }
-    if (g_state == ST_RECEIVING) active = true;
+    if (g_state == ST_RECEIVING || g_state == ST_LIVE) active = true;
     if (g_imuOk && now - lastPoll >= (g_sleeping ? 100u : IMU_POLL_MS)) {
       lastPoll = now;
       if (imu_moved()) active = true;
@@ -1048,6 +1140,22 @@ void loop() {
 
   // 受信中に切断されたら待ち受けに戻る
   if (g_state == ST_RECEIVING && g_conn == 0xff) set_state(ST_IDLE);
+  // ライブ表示中に切断されたらアニメに戻る
+  if (g_state == ST_LIVE && g_conn == 0xff) live_end();
+  if (g_state == ST_LIVE) {
+    static uint32_t lastStat = 0;
+    uint32_t now = millis();
+    if (now - lastStat >= 2000) {
+      if (g_liveFrames)
+        Serial.printf("live: %lu.%lu fps, %lu B/frame, draw %lu us/frame, dropped %lu\n",
+                      (unsigned long)(g_liveFrames * 10000 / (now - lastStat) / 10),
+                      (unsigned long)(g_liveFrames * 10000 / (now - lastStat) % 10),
+                      (unsigned long)(g_liveBytes / g_liveFrames), (unsigned long)(g_liveDrawUs / g_liveFrames),
+                      (unsigned long)g_liveDropped);
+      g_liveFrames = g_liveBytes = g_liveDrawUs = 0;
+      lastStat = now;
+    }
+  }
 
   if (g_state == ST_RECEIVING) {
     // 1 秒ごとに: 受信速度と、そのうちフラッシュの消去・書き込みに使った時間

@@ -60,6 +60,11 @@
   select, input[type=number] { font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
                                background: var(--panel); color: var(--text); }
   input[type=number] { width: 64px; }
+  section.live { grid-column: 1 / -1; }
+  canvas#scr { display: block; width: 100%; max-width: 800px; height: auto; background: #000; border-radius: 4px;
+               cursor: move; touch-action: none; }
+  canvas#scr[hidden] { display: none; }
+  input[type=range] { width: 160px; }
   #log { font: 12px/1.4 ui-monospace, Consolas, monospace; background: var(--bg); border: 1px solid var(--line);
          border-radius: 6px; padding: 8px; height: 150px; overflow: auto; white-space: pre-wrap; margin: 0; }
   .warn { background: #fff4e5; color: #8a4b00; border: 1px solid #f3c58a; border-radius: 6px; padding: 8px 10px; margin: 16px 16px 0; }
@@ -114,11 +119,23 @@
     <h2>ログ</h2>
     <pre id="log"></pre>
   </section>
+
+  <section class="live">
+    <h2>画面を映す (ライブ表示)</h2>
+    <div class="row">
+      <button id="btnCapture">画面を選ぶ</button>
+      <button id="btnLive" class="primary" disabled>XIAO に映す</button>
+      <label>範囲の大きさ <input id="liveSize" type="range" min="96" max="1920" step="2" value="384" disabled></label>
+      <span id="liveSizeText" class="status"></span>
+    </div>
+    <canvas id="scr" width="800" height="450" hidden></canvas>
+    <div id="liveStat" class="meta">「画面を選ぶ」で画面かウィンドウを選び、黄色い枠をドラッグして映す範囲を決めます (ホイールでも大きさを変えられます)。映している内容は右上のプレビューにも出ます。</div>
+  </section>
 </main>
 
 <script>
 'use strict';
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const REPO = 'WestIsland34/XIAO-MG24';   // 「ディフォルト」で GIF フォルダを読むリポジトリ
 // ===== 定数 (BLE_GIF_Player.ino と合わせる) =====
 const W = 96, H = 64, NPIX = W * H;
@@ -595,6 +612,7 @@ const DONE_MSG = ['OK', 'CRC 不一致', '形式エラー', 'サイズ超過', '
 function onNotify(e) {
   const v = new Uint8Array(e.target.value.buffer.slice(e.target.value.byteOffset, e.target.value.byteOffset + e.target.value.byteLength));
   const dv = new DataView(v.buffer);
+  if (v[0] === 0x87) { live.needKey = true; return; }   // ライブ表示のデータが抜けた
   const ev = { code: v[0], value: v.length >= 5 && v[0] < 0x83 ? dv.getUint32(1, true) : v[1], data: v };
   if (ev.code === 0x83 && ev.value !== 0) log(`XIAO: エラー ${DONE_MSG[ev.value] || ev.value}`);
   events.push(ev);
@@ -636,7 +654,8 @@ $('btnConnect').onclick = async () => {
     animCache.clear();
     showVersion();
     log(`接続: ${dev.name} (本体 v${device.fw || '?'}, プロトコル v${ver}, MTU ${device.mtu}, 1 個の上限 ${Math.round(device.bufSize / 1024)} KB)`);
-    if (ver < 3) log('XIAO のファームウェアが古いので書き込み直してください (キャッシュ機能に未対応)');
+    device.proto = ver;
+    if (ver < 4) log('XIAO のファームウェアが古いので書き込み直してください (キャッシュ・ライブ表示に未対応)');
     if (device.bufSize === 0) log('XIAO の外付けフラッシュが見つかりません');
     setStatus(`接続中: ${dev.name}`, 'ok');
     $('btnConnect').textContent = '切断';
@@ -659,6 +678,8 @@ function updateButtons() {
   $('btnSend').disabled = !connected() || selected < 0 || device.busy;
   $('btnStop').disabled = !connected() || device.busy;
   $('btnCache').disabled = !connected() || device.busy;
+  $('btnLive').disabled = !connected() || !live.stream || (device.busy && !live.on);
+  $('btnLive').textContent = live.on ? '映すのをやめる' : 'XIAO に映す';
 }
 
 // 戻り値: true = XIAO のキャッシュにあったので送らずに済んだ
@@ -792,6 +813,230 @@ async function slideTick() {
   slideTimer = setTimeout(slideTick, Math.max(3, +$('interval').value || 15) * 1000);
 }
 $('slideshow').onchange = () => slideTick();
+
+// ===== 画面を映す (ライブ表示) =====
+// 画面共有で取り込んだ映像の一部 (3:2 の枠) を 96x64 に縮小し、固定の 256 色に減色して、
+// 前のコマから変わった画素だけを送る。XIAO はフラッシュに書かずにすぐ描く。
+const live = {
+  stream: null, track: null, video: null,
+  rect: { x: 0, y: 0, w: 384 },     // 映す範囲 (取り込んだ映像の画素単位。高さは w * 2/3)
+  on: false, needKey: true, seq: 0,
+  prev: new Uint8Array(NPIX),
+};
+// 固定パレット: R6 x G7 x B6 の 252 色 + 灰色 4 色
+const LIVE_PAL = (() => {
+  const p = [];
+  for (let r = 0; r < 6; r++) for (let g = 0; g < 7; g++) for (let b = 0; b < 6; b++)
+    p.push([Math.round(r * 255 / 5), Math.round(g * 255 / 6), Math.round(b * 255 / 5)]);
+  for (const v of [24, 72, 120, 184]) p.push([v, v, v]);
+  return p;
+})();
+let LIVE_MAP = null;                // 15bit 色 → パレット番号
+function liveMap() {
+  if (LIVE_MAP) return LIVE_MAP;
+  LIVE_MAP = new Uint8Array(32768);
+  for (let k = 0; k < 32768; k++) {
+    const r = ((k >> 10) & 31) * 8 + 4, g = ((k >> 5) & 31) * 8 + 4, b = (k & 31) * 8 + 4;
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < LIVE_PAL.length; i++) {
+      const c = LIVE_PAL[i], dr = r - c[0], dg = g - c[1], db = b - c[2];
+      const d = 3 * dr * dr + 4 * dg * dg + 2 * db * db;
+      if (d < bd) { bd = d; bi = i; }
+    }
+    LIVE_MAP[k] = bi;
+  }
+  return LIVE_MAP;
+}
+
+function liveClampRect() {
+  const v = live.video; if (!v) return;
+  const vw = v.videoWidth, vh = v.videoHeight, r = live.rect;
+  r.w = Math.max(96, Math.min(r.w, vw, Math.floor(vh * 3 / 2)));
+  const h = Math.round(r.w * 2 / 3);
+  r.x = Math.max(0, Math.min(Math.round(r.x), vw - r.w));
+  r.y = Math.max(0, Math.min(Math.round(r.y), vh - h));
+  $('liveSize').value = r.w;
+  $('liveSizeText').textContent = `${r.w}×${h} → 96×64`;
+}
+// 取り込んだ画面と枠を表示する (表示用。送信とは別)
+function liveDrawScreen() {
+  const v = live.video; if (!v) return;
+  const c = $('scr'), ctx = c.getContext('2d');
+  const s = c.width / v.videoWidth;
+  ctx.drawImage(v, 0, 0, c.width, c.height);
+  const r = live.rect, h = r.w * 2 / 3;
+  ctx.fillStyle = 'rgba(0,0,0,.45)';
+  ctx.beginPath(); ctx.rect(0, 0, c.width, c.height); ctx.rect(r.x * s, r.y * s, r.w * s, h * s); ctx.fill('evenodd');
+  ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 2;
+  ctx.strokeRect(r.x * s + 1, r.y * s + 1, r.w * s - 2, h * s - 2);
+  requestAnimationFrame(liveDrawScreen);
+}
+function stopCapture() {
+  live.on = false;
+  if (live.reader) live.reader.cancel().catch(() => {});
+  if (live.stream) live.stream.getTracks().forEach(t => t.stop());
+  live.stream = live.track = live.video = null;
+  $('scr').hidden = true; $('liveSize').disabled = true;
+  updateButtons();
+}
+$('btnCapture').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+    if (live.stream) { live.on = false; live.stream.getTracks().forEach(t => t.stop()); }
+    const v = document.createElement('video');
+    v.srcObject = stream; v.muted = true; await v.play();
+    live.stream = stream; live.track = stream.getVideoTracks()[0]; live.video = v;
+    live.track.onended = stopCapture;            // ブラウザの「共有を停止」を押したとき
+    const c = $('scr');
+    c.width = Math.min(800, v.videoWidth); c.height = Math.round(c.width * v.videoHeight / v.videoWidth);
+    c.hidden = false;
+    $('liveSize').max = v.videoWidth; $('liveSize').disabled = false;
+    live.rect.w = Math.min(live.rect.w, v.videoWidth);
+    live.rect.x = (v.videoWidth - live.rect.w) / 2; live.rect.y = (v.videoHeight - live.rect.w * 2 / 3) / 2;
+    liveClampRect();
+    requestAnimationFrame(liveDrawScreen);
+    log(`画面を取り込みました (${v.videoWidth}×${v.videoHeight})`);
+    updateButtons();
+  } catch (e) {
+    if (e.name !== 'NotAllowedError') log(`画面を取り込めません: ${e.message}`);
+  }
+};
+$('liveSize').oninput = () => {
+  const r = live.rect, cx = r.x + r.w / 2, cy = r.y + r.w / 3;
+  r.w = +$('liveSize').value; r.x = cx - r.w / 2; r.y = cy - r.w / 3;
+  liveClampRect();
+};
+// 枠のドラッグ (枠の外を押すとそこへ移動) とホイールでの拡大縮小
+(() => {
+  const c = $('scr');
+  let drag = null;
+  const pos = e => { const b = c.getBoundingClientRect(), s = live.video.videoWidth / b.width; return [(e.clientX - b.left) * s, (e.clientY - b.top) * s]; };
+  c.onpointerdown = e => {
+    if (!live.video) return;
+    const [x, y] = pos(e), r = live.rect;
+    if (x < r.x || y < r.y || x > r.x + r.w || y > r.y + r.w * 2 / 3) { r.x = x - r.w / 2; r.y = y - r.w / 3; liveClampRect(); }
+    drag = [x - r.x, y - r.y];
+    c.setPointerCapture(e.pointerId);
+  };
+  c.onpointermove = e => {
+    if (!drag || !live.video) return;
+    const [x, y] = pos(e);
+    live.rect.x = x - drag[0]; live.rect.y = y - drag[1]; liveClampRect();
+  };
+  c.onpointerup = c.onpointercancel = () => { drag = null; };
+  c.onwheel = e => {
+    if (!live.video) return;
+    e.preventDefault();
+    $('liveSize').value = live.rect.w * (e.deltaY > 0 ? 1.1 : 1 / 1.1);
+    $('liveSize').oninput();
+  };
+})();
+
+async function liveSendFrame(enc, key, chunk) {
+  const total = enc.length;
+  let off = 0, count = 0;
+  do {
+    const n = Math.min(chunk, total - off);
+    const p = new Uint8Array(7 + n);
+    p[0] = 0x09; p[1] = live.seq; p[2] = key ? 1 : 0;
+    p[3] = off & 255; p[4] = off >> 8; p[5] = total & 255; p[6] = total >> 8;
+    for (let i = 0; i < n; i++) p[7 + i] = enc[off + i];
+    off += n;
+    // コマの最後と BATCH 個に 1 個は応答ありで書く (流量制御)
+    if (off >= total || ++count % BATCH === 0) await device.rx.writeValueWithResponse(p);
+    else await device.rx.writeValueWithoutResponse(p);
+  } while (off < total);
+  live.seq = (live.seq + 1) & 255;
+}
+
+async function liveLoop() {
+  const map = liveMap();
+  const can = new OffscreenCanvas(W, H);
+  const ctx = can.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  const pctx = $('preview').getContext('2d'), pimg = pctx.createImageData(W, H);
+  clearTimeout(previewTimer);
+  const zeros = new Uint8Array(NPIX);
+  const chunk = Math.min(device.mtu - 3, 244) - 7;
+
+  // バックグラウンドでもタイマーに頼らず動くように、映像のコマを直接読む (Chrome / Edge)
+  let track = null, reader = null;
+  if ('MediaStreamTrackProcessor' in window) {
+    track = live.track.clone();
+    reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    live.reader = reader;              // 止めるときに cancel して read() の待ちを終わらせる
+  }
+  // XIAO をライブ表示にしてパレットを送る
+  await device.rx.writeValueWithResponse(new Uint8Array([0x07]));
+  for (let s = 0; s < LIVE_PAL.length; s += 100) {
+    const n = Math.min(100, LIVE_PAL.length - s), p = new Uint8Array(2 + n * 2), dv = new DataView(p.buffer);
+    p[0] = 0x08; p[1] = s;
+    for (let i = 0; i < n; i++) dv.setUint16(2 + i * 2, rgb565(LIVE_PAL[s + i]), true);
+    await device.rx.writeValueWithResponse(p);
+  }
+  live.needKey = true;
+  let stFrames = 0, stBytes = 0, stAt = performance.now(), stSkip = 0;
+  try {
+    while (live.on && connected() && live.track) {
+      let src;
+      if (reader) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        src = value;
+      } else {
+        await new Promise(r => setTimeout(r, 33));
+        src = live.video;
+      }
+      const r = live.rect;
+      ctx.drawImage(src, r.x, r.y, r.w, Math.round(r.w * 2 / 3), 0, 0, W, H);
+      if (reader) src.close();
+      const d = ctx.getImageData(0, 0, W, H).data, idx = new Uint8Array(NPIX);
+      for (let p = 0, i = 0; p < NPIX; p++, i += 4) idx[p] = map[key15(d[i], d[i + 1], d[i + 2])];
+      const key = live.needKey;
+      const enc = encodeFrame(idx, key ? zeros : live.prev);
+      if (key || enc.length) {
+        live.needKey = false;
+        try {
+          await liveSendFrame(enc, key, chunk);
+          live.prev = idx;
+          stFrames++; stBytes += enc.length + 7 * Math.ceil(Math.max(1, enc.length) / chunk);
+          for (let p = 0; p < NPIX; p++) { const c = LIVE_PAL[idx[p]]; pimg.data.set([c[0], c[1], c[2], 255], p * 4); }
+          pctx.putImageData(pimg, 0, 0);
+        } catch (e) {
+          if (!connected()) break;
+          live.needKey = true;          // 途中で失敗した → 次はキーフレーム
+        }
+      } else stSkip++;
+      const now = performance.now();
+      if (now - stAt >= 1000) {
+        const sec = (now - stAt) / 1000;
+        $('liveStat').textContent = `${(stFrames / sec).toFixed(1)} コマ/秒 · ${(stBytes / 1024 / sec).toFixed(1)} KB/s · 1 コマ平均 ${stFrames ? Math.round(stBytes / stFrames) : 0} バイト · 変化なし ${stSkip}`;
+        stFrames = stBytes = stSkip = 0; stAt = now;
+      }
+    }
+  } finally {
+    if (reader) reader.cancel().catch(() => {});
+    if (track) track.stop();
+    live.reader = null;
+    live.on = false;
+    if (connected()) { try { await device.rx.writeValueWithResponse(new Uint8Array([0x0A])); } catch {} }
+    device.busy = false; updateButtons();
+    $('liveStat').textContent += ' — 停止しました';
+    log('ライブ表示を終了しました');
+  }
+}
+$('btnLive').onclick = () => {
+  if (live.on) { live.on = false; if (live.reader) live.reader.cancel().catch(() => {}); return; }
+  if (!connected() || !live.stream || device.busy) return;
+  if ((device.proto || 0) < 4) { log('XIAO のファームウェアが古いのでライブ表示できません'); return; }
+  live.on = true; device.busy = true; $('slideshow').checked = false;
+  updateButtons();
+  log('ライブ表示を開始');
+  liveLoop().catch(e => {
+    log(`ライブ表示エラー: ${e.message}`);
+    live.on = false; device.busy = false; updateButtons();
+  });
+};
 updateButtons();
 </script>
 </body>
