@@ -119,6 +119,7 @@ const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const MAX_FRAMES = 1500;
 const BATCH = 12;              // この数ごとに 1 回「応答あり」で書いて同期する (XIAO の RESP_MIN_FREE 以下にする)
+const PIPE = 4;                // 応答なしの書き込みを完了待ちせずに同時に出す数
 
 const $ = id => document.getElementById(id);
 const logEl = $('log');
@@ -540,7 +541,8 @@ async function sendAnimation(anim) {
   if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? (ev.value === 4 ? 'XIAO の外付けフラッシュが見つかりません' : 'XIAO 側の容量を超えています') : 'BEGIN に応答がありません');
 
   const t0 = performance.now();
-  let pos = 0, naks = 0, batch = BATCH, count = 0;
+  let pos = 0, naks = 0, batch = BATCH, count = 0, pipe = PIPE;
+  const inflight = [];
   const pkt = new Uint8Array(chunk), pdv = new DataView(pkt.buffer);
   const handle = e => {
     if (e.code === 0x82 && e.value < pos) { naks++; pos = e.value; batch = Math.max(1, batch >> 1); }
@@ -552,8 +554,18 @@ async function sendAnimation(anim) {
       pkt[0] = 0x02; pdv.setUint32(1, pos, true); pkt.set(buf.subarray(pos, pos + n), 5);
       const p = pkt.slice(0, 5 + n);
       // BATCH 個に 1 個は応答ありで書く → XIAO が前の分まで処理し終わるまで待つ (流量制御)
-      if (++count % batch === 0 || pos + n >= total) await device.rx.writeValueWithResponse(p);
-      else await device.rx.writeValueWithoutResponse(p);
+      if (++count % batch === 0 || pos + n >= total) {
+        await Promise.all(inflight.splice(0));
+        await device.rx.writeValueWithResponse(p);
+      } else {
+        // 前の書き込みの完了を待たずに次を出す (1 回の接続間隔に複数詰めてもらうため)。
+        // 失敗したら以後は 1 個ずつに戻す。失敗した分は XIAO が抜けとして NAK で知らせる。
+        inflight.push(device.rx.writeValueWithoutResponse(p).catch(e => {
+          if (pipe > 1) log(`同時送信に失敗したので 1 個ずつに戻します (${e.message})`);
+          pipe = 1;
+        }));
+        while (inflight.length >= pipe) await inflight.shift();
+      }
       pos += n;
       while (events.length) handle(events.shift());
       $('progress').value = pos / total;
@@ -570,7 +582,7 @@ async function sendAnimation(anim) {
   }
   const sec = (performance.now() - t0) / 1000;
   $('speed').textContent = `${(total / 1024).toFixed(1)} KB を ${sec.toFixed(1)} 秒 (${(total / 1024 / sec).toFixed(1)} KB/s, パケット ${chunk} バイト)`;
-  log(`転送 ${sec.toFixed(1)} 秒 / 抜け ${naks} 回`);
+  log(`転送 ${sec.toFixed(1)} 秒 / ${(total / 1024 / sec).toFixed(1)} KB/s / 抜け ${naks} 回 / 同時送信 ${pipe}`);
 }
 
 async function sendIndex(i) {
