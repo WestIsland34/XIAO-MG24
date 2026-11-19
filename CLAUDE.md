@@ -15,7 +15,8 @@ XIAO MG24 (EFR32MG24) で遊ぶ Arduino プロジェクト。詳細は README.md
 - 通信仕様・アニメ形式は .ino 冒頭コメントが正。変えるときは .ino と index.html の両方を直す。
 - コンパイル確認: `arduino-cli compile -b SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs BLE_GIF_Player`（RAM 約74%使用、受信バッファ160KB）。
 - 実機で転送・再生を確認済み（2026-11-19）。転送は「4パケットに1回、応答ありで書く」流量制御。応答なし書き込みを流し続けると XIAO の BLE バッファ(約3KB)が詰まり、ACK 通知が出せなくなる。
-- 描画は 8x8 タイル単位の差分。シリアルに `draw: ... ns/px, late>10ms ...` を出す（理論値 2000ns/px @8MHz）。
+- このコアの SPI は転送1回ごとに DMA を起動する（1回約25us）。Adafruit の writePixels は1画素ずつ送るので約26us/px と遅い。画素はバッファに詰めて `SPI.transfer(buf, n, true)` で一括送信する（DMA 1回の上限 2048 バイト）。
+- 描画は 8x8 タイル単位の差分。8行の帯ごとに変化範囲を1矩形にまとめて送る。シリアルに `draw: ... ns/px, late>10ms ...` を出す（理論値 2000ns/px @8MHz）。
 
 ## 作業の注意
 - 新しい表示器・センサーを扱うときは、ピン表記から推測せず型番とコントローラICを先に確認する。

@@ -291,37 +291,58 @@ static void decode_frame(const uint8_t *d, uint32_t len, int32_t &pmin, int32_t 
   }
 }
 
-// g_idx と g_shown を比べて、変化した 8x8 タイルだけを OLED に送る。
-// 横に並んだ変化タイルはまとめて 1 つの矩形として送る。戻り値は送った画素数。
+#if USE_HW_SPI
+// 1 帯 (96x8) 分の送信バッファ。RGB565 をビッグエンディアンで詰める。
+// このコアの SPI は 1 回の転送ごとに DMA を起動するので、1 画素ずつ送ると
+// 1 画素あたり約 26us かかる。まとめて 1 回で送れば SPI の速度どおりになる。
+static uint8_t g_tx[SCR_W * TILE * 2];
+#endif
+
+// g_idx と g_shown を比べて、変化した 8x8 タイルを含む部分だけを OLED に送る。
+// 8 行の帯ごとに「左端の変化タイル〜右端の変化タイル」を 1 つの矩形にする
+// (矩形を分けると 1 個あたりのコマンド送信の手間の方が大きいため)。
+// 戻り値は送った画素数。
 static uint32_t push_dirty_tiles(int y0, int y1, bool full) {
   uint32_t pixels = 0;
   int ty0 = y0 / TILE, ty1 = y1 / TILE;
   display.startWrite();
   for (int ty = ty0; ty <= ty1; ty++) {
-    bool dirty[TILES_X];
+    int txMin = TILES_X, txMax = -1;
     for (int tx = 0; tx < TILES_X; tx++) {
       bool d = full;
       for (int y = ty * TILE; !d && y < ty * TILE + TILE; y++) {
         int o = y * SCR_W + tx * TILE;
         d = memcmp(g_idx + o, g_shown + o, TILE) != 0;
       }
-      dirty[tx] = d;
-    }
-    for (int tx = 0; tx < TILES_X;) {
-      if (!dirty[tx]) { tx++; continue; }
-      int tx1 = tx;
-      while (tx1 + 1 < TILES_X && dirty[tx1 + 1]) tx1++;
-      int x0 = tx * TILE, w = (tx1 - tx + 1) * TILE;
-      display.setAddrWindow(x0, ty * TILE, w, TILE);
-      for (int y = ty * TILE; y < ty * TILE + TILE; y++) {
-        int o = y * SCR_W + x0;
-        for (int x = 0; x < w; x++) g_line[x] = g_pal[g_idx[o + x]];
-        memcpy(g_shown + o, g_idx + o, w);
-        display.writePixels(g_line, w);
+      if (d) {
+        if (tx < txMin) txMin = tx;
+        txMax = tx;
       }
-      pixels += (uint32_t)w * TILE;
-      tx = tx1 + 1;
     }
+    if (txMax < 0) continue;
+    int x0 = txMin * TILE, w = (txMax - txMin + 1) * TILE;
+    display.setAddrWindow(x0, ty * TILE, w, TILE);   // 終わると DC=データ になっている
+#if USE_HW_SPI
+    uint8_t *q = g_tx;
+    for (int y = ty * TILE; y < ty * TILE + TILE; y++) {
+      int o = y * SCR_W + x0;
+      for (int x = 0; x < w; x++) {
+        uint16_t c = g_pal[g_idx[o + x]];
+        *q++ = c >> 8;
+        *q++ = c & 0xFF;
+      }
+      memcpy(g_shown + o, g_idx + o, w);
+    }
+    SPI.transfer(g_tx, (size_t)(q - g_tx), true);   // 送信のみ・完了まで待つ
+#else
+    for (int y = ty * TILE; y < ty * TILE + TILE; y++) {
+      int o = y * SCR_W + x0;
+      for (int x = 0; x < w; x++) g_line[x] = g_pal[g_idx[o + x]];
+      memcpy(g_shown + o, g_idx + o, w);
+      display.writePixels(g_line, w);
+    }
+#endif
+    pixels += (uint32_t)w * TILE;
   }
   display.endWrite();
   return pixels;
