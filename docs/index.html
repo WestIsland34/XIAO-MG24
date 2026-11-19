@@ -117,7 +117,7 @@ const SVC  = '7e4a1000-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const RX   = '7e4a1001-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
-const MAX_FRAMES = 400;
+const MAX_FRAMES = 1500;
 const BATCH = 4;               // 応答なしで続けて送るパケット数 (この数ごとに応答ありで同期)
 
 const $ = id => document.getElementById(id);
@@ -458,7 +458,7 @@ $('dirInput').onchange = e => {
 $('fit').onchange = () => { if (selected >= 0) select(selected); };
 
 // ===== Bluetooth =====
-const device = { dev: null, rx: null, tx: null, info: null, mtu: 23, bufSize: 160 * 1024, busy: false };
+const device = { dev: null, rx: null, tx: null, info: null, mtu: 23, bufSize: 4 * 1024 * 1024 - 4096, busy: false };   // 接続後に XIAO から読む
 let waiter = null;                          // 通知を待っている人
 const events = [];
 
@@ -503,7 +503,8 @@ $('btnConnect').onclick = async () => {
     await device.tx.startNotifications();
     const ver = await readInfo();
     animCache.clear();
-    log(`接続: ${dev.name} (プロトコル v${ver}, MTU ${device.mtu}, バッファ ${device.bufSize / 1024} KB)`);
+    log(`接続: ${dev.name} (プロトコル v${ver}, MTU ${device.mtu}, 保存できる量 ${Math.round(device.bufSize / 1024)} KB)`);
+    if (device.bufSize === 0) log('XIAO の外付けフラッシュが見つかりません');
     setStatus(`接続中: ${dev.name}`, 'ok');
     $('btnConnect').textContent = '切断';
     updateButtons();
@@ -535,8 +536,8 @@ async function sendAnimation(anim) {
 
   const begin = new Uint8Array(5); begin[0] = 0x01; new DataView(begin.buffer).setUint32(1, total, true);
   await device.rx.writeValueWithResponse(begin);
-  let ev = await nextEvent(3000);
-  if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? 'XIAO 側の容量を超えています' : 'BEGIN に応答がありません');
+  let ev = await nextEvent(10000);
+  if (!ev || ev.code !== 0x81) throw new Error(ev && ev.code === 0x83 ? (ev.value === 4 ? 'XIAO の外付けフラッシュが見つかりません' : 'XIAO 側の容量を超えています') : 'BEGIN に応答がありません');
 
   const t0 = performance.now();
   let pos = 0, naks = 0, batch = BATCH, count = 0;
@@ -559,8 +560,9 @@ async function sendAnimation(anim) {
     }
     const end = new Uint8Array(5); end[0] = 0x03; new DataView(end.buffer).setUint32(1, crc32(buf), true);
     await device.rx.writeValueWithResponse(end);
-    ev = await nextEvent(5000);
-    while (ev && ev.code !== 0x83 && ev.code !== 0x82) ev = await nextEvent(5000);
+    $('speed').textContent = 'XIAO で保存内容を確認中…';
+    ev = await nextEvent(60000);   // フラッシュを読み直して CRC を確かめるので大きいと数秒かかる
+    while (ev && ev.code !== 0x83 && ev.code !== 0x82) ev = await nextEvent(60000);
     if (!ev) throw new Error('完了の応答がありません');
     if (ev.code === 0x82) { handle(ev); continue; }       // 抜けがあった → そこから続ける
     if (ev.value !== 0) throw new Error('XIAO 側で検証に失敗しました');
