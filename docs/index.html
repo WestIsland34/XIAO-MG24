@@ -118,7 +118,7 @@ const RX   = '7e4a1001-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const TX   = '7e4a1002-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const INFO = '7e4a1003-5c3b-4f6e-9a21-3d8b6c0f1a20';
 const MAX_FRAMES = 1500;
-const BATCH = 4;               // 応答なしで続けて送るパケット数 (この数ごとに応答ありで同期)
+const BATCH = 12;              // この数ごとに 1 回「応答あり」で書いて同期する (XIAO の RESP_MIN_FREE 以下にする)
 
 const $ = id => document.getElementById(id);
 const logEl = $('log');
