@@ -13,7 +13,7 @@ Seeed Studio XIAO MG24 に 0.95インチ カラー有機EL（秋月電子 114435
 | `OLED_SSD1331_Test/OLED_SSD1331_Test.ino` | 動作確認スケッチ（赤→緑→青→文字表示→動く四角） |
 | `BLE_GIF_Player/BLE_GIF_Player.ino` | PC から Bluetooth で受け取った GIF アニメを OLED でループ再生 |
 | `docs/index.html` | PC 側アプリ（ブラウザ / Web Bluetooth）。フォルダ内の GIF を選んで XIAO に送る |
-| `GIF/` | サンプルの GIF。PC 側アプリの「ディフォルト」で一覧に出る |
+| `GIF/` | サンプルの GIF。PC 側アプリの「サンプル」で一覧に出る |
 | `CLAUDE.md` | Claude Code 用のプロジェクトメモ |
 
 ## 配線
@@ -68,8 +68,8 @@ PC (Chrome / Edge)                                  XIAO MG24
 
 使い方:
 1. 「XIAO に接続」→ 一覧から **XIAO-GIF** を選ぶ
-2. GIF の一覧を出す（3 種類）
-   - **ディフォルト**: このリポジトリの `GIF/` フォルダの GIF（GitHub から読む）
+2. GIF の一覧を出す（3 種類。ページを開くとサンプルが自動で読み込まれる）
+   - **サンプル**: このリポジトリの `GIF/` フォルダの GIF（GitHub から読む）
    - **フォルダを選ぶ**: PC のフォルダを指定（次回からは「前回のフォルダ」ボタンで開ける）
    - **キャッシュを選ぶ**: XIAO のフラッシュに残っている GIF（接続が必要）。送らずにすぐ再生できる
 3. GIF をクリックするとプレビュー、「XIAO で再生」（またはダブルクリック）で転送して再生

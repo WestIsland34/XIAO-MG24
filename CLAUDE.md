@@ -16,7 +16,7 @@ XIAO MG24 (EFR32MG24) で遊ぶ Arduino プロジェクト。詳細は README.md
 - コンパイル確認: `arduino-cli compile -b SiliconLabs:silabs:xiao_mg24:protocol_stack=ble_silabs BLE_GIF_Player`（RAM 約24%）。
 - フラッシュは複数アニメのキャッシュ (リングバッファ, 目録 63 件を 0x0/0x1000 に交互書き, 再生中 id は 0x2000 に追記ログ, データは 0x3000〜)。BEGIN に CRC と名前を付け、同じ CRC があれば転送せずに再生 (DONE cached=1)。LIST (0x05) / PLAY (0x06) で一覧・再生。
 - 加速度センサー: XIAO MG24 Sense の LSM6DS3TR-C は **Wire1 (I2C0, PB2/PB3), アドレス 0x6A, 電源 PD5 (ピン19) を HIGH**。WHO_AM_I=0x6A を確認済み。1 分動きがないと `enableDisplay(false)` でスリープ、0.05g 以上の変化か BLE 操作で復帰。
-- Web の「ディフォルト」は GitHub API で `GIF/` を列挙 (IP ごと 60 回/時。会社の回線では使い切っていた) → 失敗したら jsDelivr の data API。中身は raw.githubusercontent.com。
+- Web の「サンプル」は GitHub API で `GIF/` を列挙 (IP ごと 60 回/時。会社の回線では使い切っていた) → 失敗したら jsDelivr の data API。中身は raw.githubusercontent.com。
 - バージョン: .ino の FW_VER_* と index.html の APP_VERSION。INFO の末尾 3 バイトが FW バージョン。
 - アニメは基板上の外付けフラッシュに保存: SPI1 (PB0/PB1/PA0) + CS=PA6(ピン21)。JEDEC ID `85 60 16` = Puya 4MB。ボード定義の mx25 shutdown 設定 (PC1-4) は実配線と違うので無視。
 - **コア SPI ライブラリ 5.0.0 の不具合**: `transfer(buf, n)`（送受信）は 2048 バイト超を分割するとき位置をずらさない → 2048 バイト以下に分けて呼ぶ。送信のみの `transfer(buf, n, true)` は正しい。

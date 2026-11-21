@@ -86,7 +86,7 @@
   <section>
     <h2>GIF 一覧</h2>
     <div class="row">
-      <button id="btnDefault" title="GitHub の GIF フォルダにある GIF">ディフォルト</button>
+      <button id="btnDefault" title="GitHub の GIF フォルダにある GIF">サンプル</button>
       <button id="btnFolder">フォルダを選ぶ</button>
       <button id="btnCache" title="XIAO のフラッシュに残っている GIF (接続が必要)">キャッシュを選ぶ</button>
       <button id="btnLastFolder" hidden></button>
@@ -94,7 +94,7 @@
       <span id="folderName" class="status"></span>
       <input id="dirInput" type="file" webkitdirectory multiple hidden>
     </div>
-    <div id="list" class="grid"><div class="empty">「ディフォルト」「フォルダを選ぶ」「キャッシュを選ぶ」のどれかを押すと GIF が一覧表示されます</div></div>
+    <div id="list" class="grid"><div class="empty">サンプルの GIF を読み込んでいます…（「フォルダを選ぶ」「キャッシュを選ぶ」で切り替えられます）</div></div>
   </section>
 
   <section>
@@ -139,8 +139,8 @@
 
 <script>
 'use strict';
-const APP_VERSION = '1.2.0';
-const REPO = 'WestIsland34/XIAO-MG24';   // 「ディフォルト」で GIF フォルダを読むリポジトリ
+const APP_VERSION = '1.2.1';
+const REPO = 'WestIsland34/XIAO-MG24';   // 「サンプル」で GIF フォルダを読むリポジトリ
 // ===== 定数 (BLE_GIF_Player.ino と合わせる) =====
 const W = 96, H = 64, NPIX = W * H;
 const SVC  = '7e4a1000-5c3b-4f6e-9a21-3d8b6c0f1a20';
@@ -384,9 +384,9 @@ function startPreview(anim) {
   step();
 }
 
-// ===== 一覧 (ディフォルト / フォルダ / キャッシュ) =====
+// ===== 一覧 (サンプル / フォルダ / キャッシュ) =====
 // files の要素: { name, file?, url?, cache?: { id, size, crc } }
-//   file  : GIF の中身 (Blob)。ディフォルトは選んだときに url から読む
+//   file  : GIF の中身 (Blob)。サンプルは選んだときに url から読む
 //   cache : XIAO のフラッシュに残っているアニメ (送らずに番号で再生する)
 let files = [];
 let mode = '';           // 'default' | 'folder' | 'cache'
@@ -509,8 +509,10 @@ const idb = (mode, fn) => new Promise((res, rej) => {
 });
 const gifKey = crc => 'gif:' + crc.toString(16).padStart(8, '0');
 
-// ---- ディフォルト: GitHub の GIF フォルダ ----
-$('btnDefault').onclick = async () => {
+// ---- サンプル: GitHub の GIF フォルダ ----
+// ページを開いたときにも自動で呼ぶ (引数なし = 自動)。
+$('btnDefault').onclick = async ev => {
+  const auto = !ev;
   try {
     $('folderName').textContent = 'GitHub から一覧を読み込み中…';
     let list = null;
@@ -531,10 +533,13 @@ $('btnDefault').onclick = async () => {
       list = list.map(name => ({ name, url: raw(name) }));
       try { sessionStorage.setItem('defaultList', JSON.stringify(list)); } catch {}
     }
-    setFiles(list.map(x => ({ ...x })), 'ディフォルト (GitHub の GIF フォルダ)', 'default');
+    if (auto && mode) return;   // 読み込み中に別の一覧を開いていたら上書きしない
+    setFiles(list.map(x => ({ ...x })), 'サンプル (GitHub の GIF フォルダ)', 'default');
   } catch (e) {
+    if (auto && mode) return;
     $('folderName').textContent = '';
-    log(`ディフォルトの GIF を読めませんでした: ${e.message}`);
+    if (!mode) $('list').innerHTML = '<div class="empty">サンプルの GIF を読めませんでした。「サンプル」で再読み込み、または「フォルダを選ぶ」「キャッシュを選ぶ」を押してください</div>';
+    log(`サンプルの GIF を読めませんでした: ${e.message}`);
   }
 };
 
@@ -1042,6 +1047,7 @@ $('btnLive').onclick = () => {
   });
 };
 updateButtons();
+$('btnDefault').onclick();   // 開いたらサンプルの GIF 一覧を読み込む
 </script>
 </body>
 </html>
